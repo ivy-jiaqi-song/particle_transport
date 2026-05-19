@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+run_logs/
+*.log
+*.pid
+
+# Generated scientific outputs and caches
+outputs/
+**/outputs/
+**/cache/
+full_test/
+transport_cross_analysis/
+*.h5
+*.hdf5
+
+# Local plotting/runtime caches
+.mplconfig/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,66 @@
+# Copy this file to configs/run_config.local.toml and edit the paths for the
+# machine where you are running the pipeline.
+
+[input]
+layout = "mp-weakb"
+mode_decomposition_root = "/home/user0001/MHDFlows_replicate/multiphase_mode_decomposition/outputs"
+mhd512_total_h5 = "/home/user0001/MHDFlows_replicate/h5_outputs/512_a.00100.h5"
+mhd512_mode_dir = "/home/user0001/MHDFlows_replicate/mhdflows512_mode_decomposition/outputs/512_a_00100_cs10_L200/mode_h5"
+
+[output]
+root = "outputs/campaigns_cache"
+
+[run]
+cache_mode = "mu"
+energies_gev = [1e5, 1e6, 1e7]
+campaign = ["0_5/alfven"]
+delete_cache_on_success = true
+reuse_existing_cache = true
+skip_completed_outputs = true
+stop_on_error = true
+all_particles_dmumu = false
+mu_cache_output_precision = "Float32"
+smoke = false
+
+[trajectory]
+B_paths = ["i_mag_field", "j_mag_field", "k_mag_field"]
+v_paths = ["i_velocity", "j_velocity", "k_velocity"]
+velocity_unit_in_m_per_s = 1000.0
+box_length_pc = 200.0
+eta = 0.1
+tOmega0_max = 5000.0
+use_cfl = false
+cfl = 0.2
+seed = 42
+n_particles = 100000
+precision = "Float64"
+field_subset = []
+boundary = "periodic"
+trajectory_time_stride = 1
+trajectory_output_precision = "Float32"
+progress_every = 5000
+
+[combined]
+B_paths = ["i_mag_field", "j_mag_field", "k_mag_field"]
+box_length_pc = 200.0
+field_subset = []
+compute_backend = "auto"
+compute_precision = "Float32"
+gpu_threads = 256
+particle_chunk_size = 128
+first_particle = 1
+n_particles_to_use = 10000
+particle_selection = "block-random"
+particle_seed = 20260423
+particle_block_size = 128
+lag_mode = "uniform-samples"
+n_lag_samples = 40
+max_lag_steps = "none"
+lag_step_stride = 1
+n_mu_bins = 24
+mu_min = -1.0
+mu_max = 1.0
+min_count_per_cell = 20
+max_pair_visits_without_allow = 5.0e9
+allow_huge = true
+use_usetex = false

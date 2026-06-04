@@ -11,6 +11,10 @@ run_logs/
 *.log
 *.pid
 
+# Local task notes and machine-specific config
+task_*.md
+configs/*.local.toml
+
 # Generated scientific outputs and caches
 outputs/
 **/outputs/

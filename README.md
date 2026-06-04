@@ -29,6 +29,17 @@ multienergy particle transport workflow.
   - Discovers `delta_mu2_dmumu_full.h5` products and creates mode, energy, or
     turbulence comparison figures automatically.
 
+- `configs/run_config.example.toml`
+  - Example machine/run configuration.
+  - Copy it to `configs/run_config.local.toml` and edit paths and run sizes.
+
+- `scripts/run_pipeline.sh`
+  - Linux foreground runner that calls Julia with the TOML config.
+
+- `scripts/run_pipeline_background.sh`
+  - Linux background runner using `nohup`.
+  - Prints the PID and writes `run_logs/*.log` plus `run_logs/*.pid`.
+
 ## Requirements
 
 Julia packages used by the runner:
@@ -48,16 +59,15 @@ The Julia runner expects a CUDA-capable GPU for the trajectory stage.
 
 ## Input Data
 
-The main runner reads static turbulence HDF5 files. The input paths are defined
-near the top of `multimode_multienergy_cache_pipeline.jl`:
+The main runner reads static turbulence HDF5 files. For a new machine, copy the
+example config and edit the input paths:
 
-```julia
-const MODE_DECOMPOSITION_ROOT = raw"/home/user0001/MHDFlows_replicate/multiphase_mode_decomposition/outputs"
-const MHD512_TOTAL_H5 = raw"/home/user0001/MHDFlows_replicate/h5_outputs/512_a.00100.h5"
-const MHD512_MODE_DIR = raw"/home/user0001/MHDFlows_replicate/mhdflows512_mode_decomposition/outputs/512_a_00100_cs10_L200/mode_h5"
+```bash
+cp configs/run_config.example.toml configs/run_config.local.toml
 ```
 
-Edit these constants before running on another machine.
+Then edit `[input]` in `configs/run_config.local.toml`. Local config files are
+ignored by Git.
 
 For `--mp-weakb`, the script expects mode-decomposed files like:
 
@@ -81,88 +91,125 @@ Each turbulence HDF5 file should contain magnetic field datasets named
 
 ## Main Configuration
 
-Most runtime settings live in `CACHE_PIPELINE_CFG` inside
-`multimode_multienergy_cache_pipeline.jl`.
+Use `configs/run_config.local.toml` for normal runs. The built-in
+`CACHE_PIPELINE_CFG` still provides defaults, but the TOML config is the
+recommended user-facing configuration.
 
-Important top-level entries:
+Important `[input]` entries:
 
-- `:cache_mode`
-  - `:mu` writes only pitch angle versus time and is usually the practical default.
-  - `:phase_space` writes positions and momenta, which is much larger.
+- `layout`
+  - `mp-weakb` or `mhd512`.
 
-- `:energies`
+- `mode_decomposition_root`
+  - Root folder for multiphase mode HDF5 files.
+
+- `mhd512_total_h5` and `mhd512_mode_dir`
+  - Total and mode-decomposed MHD512 inputs.
+
+Important `[output]` entries:
+
+- `root`
+  - Base output folder. The runner creates cache-mode and campaign subfolders
+    below this path.
+
+Important `[run]` entries:
+
+- `cache_mode`
+  - `mu` writes only pitch angle versus time and is usually the practical default.
+  - `phase-space` writes positions and momenta, which is much larger.
+
+- `energies_gev`
   - Energies in GeV, for example `[1e5, 1e6, 1e7]`.
 
-- `:delete_cache_on_success`
+- `campaign`
+  - Exact campaign selectors, for example `["0_5/alfven"]`.
+  - You can also use `turbulence = ["0_5"]` and `mode = ["alfven", "fast"]`.
+
+- `delete_cache_on_success`
   - `true` removes intermediate cache files after the final products are verified.
   - Use `--keep-caches` at runtime if you want to keep them.
 
-- `:reuse_existing_cache`
+- `reuse_existing_cache`
   - `true` reuses an existing cache if found.
   - Use `--regenerate-caches` to force rerunning trajectory/cache generation.
 
-- `:skip_completed_outputs`
+- `skip_completed_outputs`
   - `true` skips an energy if the final HDF5 and PNG outputs already verify.
   - Use `--force-recompute` to recompute final products.
 
-Important `:trajectory_overrides` entries:
+Important `[trajectory]` entries:
 
-- `:n_particles`
-- `:tOmega0_max`
-- `:trajectory_time_stride`
-- `:field_subset`
-- `:boundary`
-- `:precision`
-- `:eta`
+- `n_particles`
+- `tOmega0_max`
+- `trajectory_time_stride`
+- `field_subset`
+- `boundary`
+- `precision`
+- `eta`
 
-Important `:combined_overrides` entries:
+Important `[combined]` entries:
 
-- `:n_particles_to_use`
-- `:particle_selection`
-- `:particle_chunk_size`
-- `:n_lag_samples`
-- `:n_mu_bins`
-- `:min_count_per_cell`
-- `:compute_backend`
-- `:compute_precision`
+- `n_particles_to_use`
+- `particle_selection`
+- `particle_chunk_size`
+- `n_lag_samples`
+- `n_mu_bins`
+- `min_count_per_cell`
+- `compute_backend`
+- `compute_precision`
 
 For a quick test, use `--smoke`; it reduces particle count, field size, lag
 count, and runtime.
 
 ## Running The Main Pipeline
 
-Run from this folder:
+Run a smoke test from this folder:
 
 ```bash
 cd particle_transport_pipeline
-julia multimode_multienergy_cache_pipeline.jl --smoke
+bash scripts/run_pipeline.sh smoke
 ```
 
-Run selected multiphase modes:
+Run the configured full foreground job:
 
 ```bash
-julia multimode_multienergy_cache_pipeline.jl --mp-weakb --turbulence=0_5 --mode=alfven,fast,slow --cache-mode=mu
+bash scripts/run_pipeline.sh full
 ```
 
-Run one exact campaign selector:
+Run in the background on a remote Linux machine:
 
 ```bash
-julia multimode_multienergy_cache_pipeline.jl --mp-weakb --campaign=0_5/alfven --cache-mode=mu
+bash scripts/run_pipeline_background.sh full
 ```
 
-Run the MHD512 total plus modes:
+The background script prints the process ID and the log paths, for example:
+
+```text
+Started pipeline PID: 12345
+Log: /path/to/particle_transport_pipeline/run_logs/pipeline_full_20260604_120000.log
+PID file: /path/to/particle_transport_pipeline/run_logs/pipeline_full_20260604_120000.pid
+```
+
+Direct Julia commands still work:
 
 ```bash
-julia multimode_multienergy_cache_pipeline.jl --mhd512 --mode=total,alfven,fast,slow --cache-mode=mu
+julia multimode_multienergy_cache_pipeline.jl --config=configs/run_config.local.toml --smoke
+julia multimode_multienergy_cache_pipeline.jl --config=configs/run_config.local.toml --campaign=0_5/alfven --cache-mode=mu
 ```
 
 Useful runtime flags:
 
+- `--config=PATH`
+- `--output-root=PATH`
+- `--mode-decomposition-root=PATH`
+- `--mhd512-total-h5=PATH`
+- `--mhd512-mode-dir=PATH`
 - `--layout=mp-weakb` or `--mp-weakb`
 - `--layout=mhd512` or `--mhd512`
 - `--turbulence=0_5,0_9`
 - `--mode=alfven,fast,slow`
 - `--campaign=0_5/alfven`
+- `--energy=1e5` or `--energies=1e5,1e6,1e7`
 - `--cache-mode=mu`
 - `--cache-mode=phase-space`
 - `--keep-caches`
@@ -289,5 +336,8 @@ The manifest records each figure path and the HDF5 files used to create it.
 ## Git Notes
 
 The repository-level `.gitignore` ignores generated outputs, logs, caches, and
-large HDF5 products by default. The intended GitHub commit is this source
-folder plus project notes, not the heavy generated result tree.
+large HDF5 products by default. It also ignores local task notes like
+`task_*.md` and machine-specific config files like
+`configs/run_config.local.toml`. The intended GitHub commit is this source
+folder plus reusable scripts/config examples, not the heavy generated result
+tree.

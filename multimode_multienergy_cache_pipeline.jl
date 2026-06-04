@@ -12,6 +12,7 @@ using CUDA
 using HDF5
 using Printf
 using Statistics
+using TOML
 
 const MODE_DECOMPOSITION_ROOT = raw"/home/user0001/MHDFlows_replicate/multiphase_mode_decomposition/outputs"
 const TURBULENCE_TAGS = ("0_5", "0_9", "1_0")
@@ -75,6 +76,14 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :use_usetex => false,
     ),
 )
+
+function default_input_paths()
+    return Dict{Symbol, Any}(
+        :mode_decomposition_root => MODE_DECOMPOSITION_ROOT,
+        :mhd512_total_h5 => MHD512_TOTAL_H5,
+        :mhd512_mode_dir => MHD512_MODE_DIR,
+    )
+end
 
 function shallow_copy_dict(dict_like)
     return Dict{Symbol, Any}(pair.first => pair.second for pair in pairs(dict_like))
@@ -140,17 +149,17 @@ function parse_campaign_selector(value::AbstractString)
     return normalize_campaign_selector.(parsed)
 end
 
-function mode_h5_path(turbulence_tag::AbstractString, mode_name::AbstractString)
+function mode_h5_path(input_paths, turbulence_tag::AbstractString, mode_name::AbstractString)
     full_tag = "MP_WeakB_" * turbulence_tag * "tcs"
     return joinpath(
-        MODE_DECOMPOSITION_ROOT,
+        input_paths[:mode_decomposition_root],
         full_tag * "_cs1_L200",
         "mode_h5",
         full_tag * "_" * mode_name * ".h5",
     )
 end
 
-function build_mode_campaigns(root_prefix::AbstractString)
+function build_mode_campaigns(root_prefix::AbstractString, input_paths)
     campaigns = Dict{Symbol, Any}[]
     for turbulence_tag in TURBULENCE_TAGS
         for mode_name in MODE_NAMES
@@ -161,7 +170,7 @@ function build_mode_campaigns(root_prefix::AbstractString)
                     :turbulence_tag => turbulence_tag,
                     :mode_name => mode_name,
                     :campaign_root => joinpath(root_prefix, turbulence_tag, mode_name),
-                    :turbulence_h5 => mode_h5_path(turbulence_tag, mode_name),
+                    :turbulence_h5 => mode_h5_path(input_paths, turbulence_tag, mode_name),
                 ),
             )
         end
@@ -169,11 +178,11 @@ function build_mode_campaigns(root_prefix::AbstractString)
     return campaigns
 end
 
-function mhd512_mode_h5_path(mode_name::AbstractString)
-    return joinpath(MHD512_MODE_DIR, MHD512_DATASET_TAG * "_" * mode_name * ".h5")
+function mhd512_mode_h5_path(input_paths, mode_name::AbstractString)
+    return joinpath(input_paths[:mhd512_mode_dir], MHD512_DATASET_TAG * "_" * mode_name * ".h5")
 end
 
-function build_mhd512_campaigns(root_prefix::AbstractString)
+function build_mhd512_campaigns(root_prefix::AbstractString, input_paths)
     campaigns = Dict{Symbol, Any}[]
     push!(
         campaigns,
@@ -182,7 +191,7 @@ function build_mhd512_campaigns(root_prefix::AbstractString)
             :turbulence_tag => MHD512_DATASET_TAG,
             :mode_name => "total",
             :campaign_root => joinpath(root_prefix, MHD512_DATASET_TAG, "total"),
-            :turbulence_h5 => MHD512_TOTAL_H5,
+            :turbulence_h5 => input_paths[:mhd512_total_h5],
         ),
     )
 
@@ -194,16 +203,16 @@ function build_mhd512_campaigns(root_prefix::AbstractString)
                 :turbulence_tag => MHD512_DATASET_TAG,
                 :mode_name => mode_name,
                 :campaign_root => joinpath(root_prefix, MHD512_DATASET_TAG, mode_name),
-                :turbulence_h5 => mhd512_mode_h5_path(mode_name),
+                :turbulence_h5 => mhd512_mode_h5_path(input_paths, mode_name),
             ),
         )
     end
     return campaigns
 end
 
-function build_campaigns(input_layout::Symbol, root_prefix::AbstractString)
-    input_layout == :mp_weakb && return build_mode_campaigns(root_prefix)
-    input_layout == :mhd512 && return build_mhd512_campaigns(root_prefix)
+function build_campaigns(input_layout::Symbol, root_prefix::AbstractString, input_paths)
+    input_layout == :mp_weakb && return build_mode_campaigns(root_prefix, input_paths)
+    input_layout == :mhd512 && return build_mhd512_campaigns(root_prefix, input_paths)
     error("Unknown input layout: " * string(input_layout))
 end
 
@@ -944,13 +953,247 @@ function materialize_campaign_cfg(cfg, campaign_spec)
     return campaign_cfg
 end
 
+function resolve_repo_path(value)
+    path = expanduser(String(value))
+    return isabspath(path) ? normpath(path) : normpath(joinpath(@__DIR__, path))
+end
+
+function resolve_cli_path(value)
+    path = expanduser(String(value))
+    return isabspath(path) ? normpath(path) : abspath(path)
+end
+
+function config_path_from_args(args)
+    for argument in args
+        startswith(argument, "--config=") && return split(argument, "=", limit=2)[2]
+    end
+    return nothing
+end
+
+function toml_section(config, name::AbstractString)
+    section = get(config, name, nothing)
+    section === nothing && return Dict{String, Any}()
+    section isa AbstractDict || error("[" * name * "] must be a TOML table.")
+    return section
+end
+
+function validate_toml_keys(section, allowed_keys, section_name::AbstractString)
+    unknown = sort([String(key) for key in keys(section) if !(String(key) in allowed_keys)])
+    isempty(unknown) && return nothing
+    error("Unknown key(s) in " * section_name * ": " * join(unknown, ", "))
+end
+
+function config_bool(value, key_name::AbstractString)
+    value isa Bool && return value
+    if value isa AbstractString
+        normalized = lowercase(strip(value))
+        normalized in ("true", "yes", "1") && return true
+        normalized in ("false", "no", "0") && return false
+    end
+    error(key_name * " must be true or false.")
+end
+
+function config_int(value, key_name::AbstractString)
+    value isa Integer && return Int(value)
+    if value isa AbstractFloat && isinteger(value)
+        return Int(value)
+    elseif value isa AbstractString
+        return parse(Int, strip(value))
+    end
+    error(key_name * " must be an integer.")
+end
+
+function config_float(value, key_name::AbstractString)
+    value isa Real && return Float64(value)
+    value isa AbstractString && return parse(Float64, strip(value))
+    error(key_name * " must be numeric.")
+end
+
+function config_precision(value, key_name::AbstractString)
+    normalized = lowercase(strip(String(value)))
+    normalized == "float32" && return Float32
+    normalized == "float64" && return Float64
+    error(key_name * " must be Float32 or Float64.")
+end
+
+function config_symbol(value, key_name::AbstractString)
+    value isa AbstractString || error(key_name * " must be a string.")
+    return Symbol(replace(lowercase(strip(value)), "-" => "_"))
+end
+
+function config_string_selector(value, key_name::AbstractString)
+    if value isa AbstractString
+        return split_csv_selector(value; flag_name=key_name)
+    elseif value isa AbstractVector
+        isempty(value) && error(key_name * " cannot be an empty array. Use \"all\" or omit the key.")
+        values = String[strip(String(item)) for item in value]
+        any(isempty, values) && error(key_name * " cannot contain empty values.")
+        return values
+    end
+    error(key_name * " must be a string or array of strings.")
+end
+
+function config_campaign_selector(value, key_name::AbstractString)
+    selected = config_string_selector(value, key_name)
+    selected === nothing && return nothing
+    return normalize_campaign_selector.(selected)
+end
+
+function config_energy_values(value, key_name::AbstractString)
+    if value isa AbstractString
+        selected = split_csv_selector(value; flag_name=key_name)
+        selected === nothing && error(key_name * " must list one or more energies.")
+        return [parse(Float64, energy) for energy in selected]
+    elseif value isa AbstractVector
+        isempty(value) && error(key_name * " cannot be empty.")
+        return [config_float(energy, key_name) for energy in value]
+    end
+    error(key_name * " must be a string or array of numbers.")
+end
+
+function config_tuple3_strings(value, key_name::AbstractString)
+    values = if value isa AbstractString
+        split_csv_selector(value; flag_name=key_name)
+    elseif value isa AbstractVector
+        String[strip(String(item)) for item in value]
+    else
+        error(key_name * " must be a string or array of three strings.")
+    end
+    values === nothing && error(key_name * " must contain three dataset paths.")
+    length(values) == 3 || error(key_name * " must contain exactly three dataset paths.")
+    any(isempty, values) && error(key_name * " cannot contain empty dataset paths.")
+    return Tuple(values)
+end
+
+function config_field_subset(value, key_name::AbstractString)
+    if value isa AbstractString
+        normalized = lowercase(strip(value))
+        normalized in ("", "none", "nothing") && return nothing
+        parts = split(value, ",")
+        length(parts) == 3 || error(key_name * " must be none or three integers.")
+        return Tuple([parse(Int, strip(part)) for part in parts])
+    elseif value isa AbstractVector
+        isempty(value) && return nothing
+        length(value) == 3 || error(key_name * " must be an empty array or three integers.")
+        return Tuple([config_int(item, key_name) for item in value])
+    end
+    error(key_name * " must be none, an empty array, or three integers.")
+end
+
+function config_maybe_int(value, key_name::AbstractString)
+    if value isa AbstractString && (lowercase(strip(value)) in ("none", "nothing"))
+        return nothing
+    end
+    return config_int(value, key_name)
+end
+
+function config_maybe_particle_count(value, key_name::AbstractString)
+    if value isa AbstractString && (lowercase(strip(value)) in ("all", "none", "nothing"))
+        return nothing
+    end
+    return config_int(value, key_name)
+end
+
+function convert_override_value(key::Symbol, value, key_name::AbstractString)
+    key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
+    key == :field_subset && return config_field_subset(value, key_name)
+    key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
+    key in (:boundary, :compute_backend, :particle_selection, :lag_mode) && return config_symbol(value, key_name)
+    key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
+    key == :max_lag_steps && return config_maybe_int(value, key_name)
+    return value
+end
+
+function apply_override_section!(target, section, section_name::AbstractString)
+    allowed_keys = Set(string(key) for key in keys(target))
+    validate_toml_keys(section, allowed_keys, section_name)
+    for (key, value) in section
+        target_key = Symbol(key)
+        target[target_key] = convert_override_value(target_key, value, section_name * "." * String(key))
+    end
+    return nothing
+end
+
+function apply_toml_config!(cfg, config_path::AbstractString)
+    absolute_config_path = resolve_cli_path(config_path)
+    isfile(absolute_config_path) || error("Config file not found: " * absolute_config_path)
+    config = TOML.parsefile(absolute_config_path)
+
+    validate_toml_keys(config, Set(["input", "output", "run", "trajectory", "combined"]), "config")
+
+    input = toml_section(config, "input")
+    validate_toml_keys(input, Set(["layout", "mode_decomposition_root", "mhd512_total_h5", "mhd512_mode_dir"]), "[input]")
+    haskey(input, "layout") && (cfg[:input_layout] = parse_input_layout(input["layout"]))
+    haskey(input, "mode_decomposition_root") && (cfg[:input_paths][:mode_decomposition_root] = resolve_repo_path(input["mode_decomposition_root"]))
+    haskey(input, "mhd512_total_h5") && (cfg[:input_paths][:mhd512_total_h5] = resolve_repo_path(input["mhd512_total_h5"]))
+    haskey(input, "mhd512_mode_dir") && (cfg[:input_paths][:mhd512_mode_dir] = resolve_repo_path(input["mhd512_mode_dir"]))
+
+    output = toml_section(config, "output")
+    validate_toml_keys(output, Set(["root"]), "[output]")
+    haskey(output, "root") && (cfg[:output_root] = resolve_repo_path(output["root"]))
+
+    run = toml_section(config, "run")
+    validate_toml_keys(
+        run,
+        Set([
+            "cache_mode",
+            "energies_gev",
+            "turbulence",
+            "mode",
+            "campaign",
+            "delete_cache_on_success",
+            "reuse_existing_cache",
+            "skip_completed_outputs",
+            "stop_on_error",
+            "all_particles_dmumu",
+            "mu_cache_output_precision",
+            "smoke",
+        ]),
+        "[run]",
+    )
+    haskey(run, "cache_mode") && (cfg[:cache_mode] = parse_cache_mode(run["cache_mode"]))
+    haskey(run, "energies_gev") && (cfg[:energies] = config_energy_values(run["energies_gev"], "[run].energies_gev"))
+    haskey(run, "turbulence") && (cfg[:selected_turbulences] = config_string_selector(run["turbulence"], "[run].turbulence"))
+    haskey(run, "mode") && (cfg[:selected_modes] = config_string_selector(run["mode"], "[run].mode"))
+    haskey(run, "campaign") && (cfg[:selected_campaigns] = config_campaign_selector(run["campaign"], "[run].campaign"))
+    haskey(run, "delete_cache_on_success") && (cfg[:delete_cache_on_success] = config_bool(run["delete_cache_on_success"], "[run].delete_cache_on_success"))
+    haskey(run, "reuse_existing_cache") && (cfg[:reuse_existing_cache] = config_bool(run["reuse_existing_cache"], "[run].reuse_existing_cache"))
+    haskey(run, "skip_completed_outputs") && (cfg[:skip_completed_outputs] = config_bool(run["skip_completed_outputs"], "[run].skip_completed_outputs"))
+    haskey(run, "stop_on_error") && (cfg[:stop_on_error] = config_bool(run["stop_on_error"], "[run].stop_on_error"))
+    haskey(run, "all_particles_dmumu") && (cfg[:run_all_particles_dmumu] = config_bool(run["all_particles_dmumu"], "[run].all_particles_dmumu"))
+    haskey(run, "mu_cache_output_precision") && (cfg[:mu_cache_output_precision] = config_precision(run["mu_cache_output_precision"], "[run].mu_cache_output_precision"))
+    haskey(run, "smoke") && (cfg[:smoke] = config_bool(run["smoke"], "[run].smoke"))
+
+    apply_override_section!(cfg[:trajectory_overrides], toml_section(config, "trajectory"), "[trajectory]")
+    apply_override_section!(cfg[:combined_overrides], toml_section(config, "combined"), "[combined]")
+    return absolute_config_path
+end
+
+function apply_all_particles_dmumu!(cfg)
+    cfg[:run_all_particles_dmumu] = true
+    merge!(cfg[:combined_overrides], Dict{Symbol, Any}(
+        :first_particle => 1,
+        :n_particles_to_use => nothing,
+        :particle_selection => :range,
+        :allow_huge => true,
+    ))
+    return nothing
+end
+
 function runtime_config()
     cfg = shallow_copy_dict(CACHE_PIPELINE_CFG)
     cfg[:trajectory_overrides] = shallow_copy_dict(CACHE_PIPELINE_CFG[:trajectory_overrides])
     cfg[:combined_overrides] = shallow_copy_dict(CACHE_PIPELINE_CFG[:combined_overrides])
+    cfg[:input_paths] = default_input_paths()
+    cfg[:output_root] = joinpath(@__DIR__, "outputs", "campaigns_cache")
+    cfg[:input_layout] = :mp_weakb
+    cfg[:smoke] = false
 
-    cache_mode = CACHE_PIPELINE_CFG[:cache_mode]
-    input_layout = :mp_weakb
+    config_path = config_path_from_args(ARGS)
+    cfg[:config_path] = config_path === nothing ? nothing : apply_toml_config!(cfg, config_path)
+
+    cache_mode = cfg[:cache_mode]
+    input_layout = cfg[:input_layout]
     for argument in ARGS
         if startswith(argument, "--cache-mode=")
             cache_mode = parse_cache_mode(split(argument, "=", limit=2)[2])
@@ -964,22 +1207,33 @@ function runtime_config()
             input_layout = :mhd512
         elseif argument == "--mp-weakb"
             input_layout = :mp_weakb
+        elseif startswith(argument, "--output-root=")
+            cfg[:output_root] = resolve_cli_path(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--mode-decomposition-root=")
+            cfg[:input_paths][:mode_decomposition_root] = resolve_cli_path(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--mhd512-total-h5=")
+            cfg[:input_paths][:mhd512_total_h5] = resolve_cli_path(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--mhd512-mode-dir=")
+            cfg[:input_paths][:mhd512_mode_dir] = resolve_cli_path(split(argument, "=", limit=2)[2])
         end
     end
     cfg[:cache_mode] = cache_mode
     cfg[:input_layout] = input_layout
 
-    root_prefix = joinpath(@__DIR__, "outputs", "campaigns_cache", cache_mode_label(cache_mode))
-    if any(argument -> argument == "--smoke", ARGS)
-        root_prefix = joinpath(@__DIR__, "outputs", "campaigns_cache", "smoke", cache_mode_label(cache_mode))
+    smoke_run = cfg[:smoke] || any(argument -> argument == "--smoke", ARGS)
+    cfg[:smoke] = smoke_run
+
+    root_prefix = joinpath(cfg[:output_root], cache_mode_label(cache_mode))
+    if smoke_run
+        root_prefix = joinpath(cfg[:output_root], "smoke", cache_mode_label(cache_mode))
     end
-    all_campaigns = build_campaigns(input_layout, root_prefix)
+    all_campaigns = build_campaigns(input_layout, root_prefix, cfg[:input_paths])
 
-    selected_turbulences = nothing
-    selected_modes = nothing
-    selected_campaigns = nothing
+    selected_turbulences = get(cfg, :selected_turbulences, nothing)
+    selected_modes = get(cfg, :selected_modes, nothing)
+    selected_campaigns = get(cfg, :selected_campaigns, nothing)
 
-    if any(argument -> argument == "--smoke", ARGS)
+    if smoke_run
         cfg[:energies] = [1e5, 3e5]
         selected_campaigns = input_layout == :mhd512 ? [MHD512_DATASET_TAG * "/total"] : ["0_5/alfven"]
         merge!(cfg[:trajectory_overrides], Dict{Symbol, Any}(
@@ -1010,6 +1264,10 @@ function runtime_config()
             selected_modes = split_csv_selector(split(argument, "=", limit=2)[2]; flag_name="--mode")
         elseif startswith(argument, "--campaign=")
             selected_campaigns = parse_campaign_selector(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--energy=")
+            cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energy")
+        elseif startswith(argument, "--energies=")
+            cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energies")
         end
     end
 
@@ -1023,13 +1281,9 @@ function runtime_config()
         cfg[:skip_completed_outputs] = false
     end
     if any(argument -> argument == "--all-particles-dmumu", ARGS)
-        cfg[:run_all_particles_dmumu] = true
-        merge!(cfg[:combined_overrides], Dict{Symbol, Any}(
-            :first_particle => 1,
-            :n_particles_to_use => nothing,
-            :particle_selection => :range,
-            :allow_huge => true,
-        ))
+        apply_all_particles_dmumu!(cfg)
+    elseif cfg[:run_all_particles_dmumu]
+        apply_all_particles_dmumu!(cfg)
     end
 
     validate_selected_values(all_campaigns, selected_turbulences, :turbulence_tag, "--turbulence")
@@ -1060,10 +1314,12 @@ end
 function main()
     cfg = runtime_config()
     println("Multimode multi-energy cache pipeline")
+    cfg[:config_path] !== nothing && println("  config                   = ", cfg[:config_path])
     println("  input layout             = ", cfg[:input_layout])
     println("  mode campaigns           = ", campaign_tags(cfg))
     println("  cache mode               = ", cfg[:cache_mode])
     println("  energies [GeV]           = ", cfg[:energies])
+    println("  output root              = ", cfg[:output_root])
     println("  delete cache             = ", cfg[:delete_cache_on_success])
     println("  reuse existing cache     = ", cfg[:reuse_existing_cache])
     println("  skip completed outputs   = ", cfg[:skip_completed_outputs])

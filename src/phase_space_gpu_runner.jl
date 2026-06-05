@@ -11,7 +11,8 @@ const GEV_TO_J = 1e9 * EV_TO_J
 const UGAUSS_TO_T = 1e-10
 const KMPS_TO_MPS = 1e3
 const PC_TO_M = 3.085677581e16
-const DEFAULT_OUTPUT_DIR = joinpath(@__DIR__, "outputs", "phase_space_gpu_runner")
+const PIPELINE_ROOT = dirname(@__DIR__)
+const DEFAULT_OUTPUT_DIR = joinpath(PIPELINE_ROOT, "outputs", "phase_space_gpu_runner")
 
 const CFG = Dict{Symbol, Any}(
     :file => raw"/data/multiphase/MP_WeakB_0_5tcs.h5",

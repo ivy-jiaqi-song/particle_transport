@@ -2,27 +2,62 @@
 # machine where you are running the pipeline.
 
 [input]
-layout = "mp-weakb"
-mode_decomposition_root = "/home/user0001/MHDFlows_replicate/multiphase_mode_decomposition/outputs"
-mhd512_total_h5 = "/home/user0001/MHDFlows_replicate/h5_outputs/512_a.00100.h5"
-mhd512_mode_dir = "/home/user0001/MHDFlows_replicate/mhdflows512_mode_decomposition/outputs/512_a_00100_cs10_L200/mode_h5"
+# Directory containing the HDF5 turbulence files for this dataset.
+h5_dir = "/home/user0001/MHDFlows_replicate/multiphase_mode_decomposition/outputs/MP_WeakB_0_5tcs_cs1_L200/mode_h5"
+
+# User-facing labels. These are used in output paths:
+# outputs/campaigns_cache/<cache_mode>/<medium>/<label>/<mode>/<energy>_GeV/
+label = "0_5"
+medium = "mp"  # "iso" for isothermal, "mp" for multiphase.
+
+# File naming. With mode_decomposition_available=true, files default to
+# <file_stem>_alfven.h5, <file_stem>_fast.h5, and <file_stem>_slow.h5.
+file_stem = "MP_WeakB_0_5tcs"
+mode_file_pattern = "{stem}_{mode}.h5"
+
+# If mode_decomposition_available=false, the pipeline reads total_file instead.
+# total_file = "MP_WeakB_0_5tcs.h5"
 
 [output]
 root = "outputs/campaigns_cache"
 
 [run]
+# Core output/cache choice.
+# "phase-space" records positions and momenta. "mu" records pitch angle only and
+# is smaller when the only downstream product is D_mumu.
 cache_mode = "mu"
+
+# Set false to stop after trajectory/cache generation.
+compute_dmumu = true
+
+# Mode repetition logic. If true, the input directory contains mode files with
+# suffixes such as _alfven, _fast, and _slow. If false, only total_file is used.
+mode_decomposition_available = true
+available_modes = ["alfven", "fast", "slow"]
+
+# Full repeat: every selected energy for every selected mode.
 energies_gev = [1e5, 1e6, 1e7]
-campaign = ["0_5/alfven"]
+modes = "all"
+
+# Selective campaign example. Uncomment to run only specific mode/energy pairs.
+# If this is present, it replaces the modes/energies full-repeat selection.
+# [[run.campaigns]]
+# mode = "alfven"
+# energies_gev = [1e5]
+#
+# [[run.campaigns]]
+# mode = "fast"
+# energies_gev = [1e6, 1e7]
+
 delete_cache_on_success = true
 reuse_existing_cache = true
 skip_completed_outputs = true
 stop_on_error = true
-all_particles_dmumu = false
 mu_cache_output_precision = "Float32"
 smoke = false
 
-[trajectory]
+[particles]
+# Physical trajectory settings.
 B_paths = ["i_mag_field", "j_mag_field", "k_mag_field"]
 v_paths = ["i_velocity", "j_velocity", "k_velocity"]
 velocity_unit_in_m_per_s = 1000.0
@@ -31,22 +66,31 @@ eta = 0.1
 tOmega0_max = 5000.0
 use_cfl = false
 cfl = 0.2
+boundary = "periodic"
+
+# Ensemble and trajectory-cache burden settings.
 seed = 42
 n_particles = 100000
 precision = "Float64"
 field_subset = []
-boundary = "periodic"
 trajectory_time_stride = 1
 trajectory_output_precision = "Float32"
 progress_every = 5000
 
-[combined]
+[dmumu]
+# Particle subset for D_mumu only. "all" uses all cached particles; "sample"
+# uses the selection controls below. Lag settings are still used in both modes.
+particles = "sample"
+
+# Field and backend settings used while reconstructing mu or reading mu cache.
 B_paths = ["i_mag_field", "j_mag_field", "k_mag_field"]
 box_length_pc = 200.0
 field_subset = []
 compute_backend = "auto"
 compute_precision = "Float32"
 gpu_threads = 256
+
+# D_mumu computational-burden controls.
 particle_chunk_size = 128
 first_particle = 1
 n_particles_to_use = 10000
@@ -57,6 +101,8 @@ lag_mode = "uniform-samples"
 n_lag_samples = 40
 max_lag_steps = "none"
 lag_step_stride = 1
+
+# D_mumu binning and safety controls.
 n_mu_bins = 24
 mu_min = -1.0
 mu_max = 1.0

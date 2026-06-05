@@ -7,9 +7,10 @@ using Statistics
 
 const UGAUSS_TO_T = 1e-10
 const PC_TO_M = 3.085677581e16
+const PIPELINE_ROOT = dirname(@__DIR__)
 
 const CFG = Dict{Symbol, Any}(
-    :trajectory_h5 => joinpath(@__DIR__, "outputs", "campaigns", "0_5", "trajectory_cache","phase_space_10000000_GeV.h5"),
+    :trajectory_h5 => joinpath(PIPELINE_ROOT, "outputs", "campaigns", "0_5", "trajectory_cache","phase_space_10000000_GeV.h5"),
     :turbulence_h5 => raw"/data/multiphase/MP_WeakB_0_5tcs.h5",
     :B_paths => ("i_mag_field", "j_mag_field", "k_mag_field"),
     :box_length_pc => 200.0,
@@ -22,8 +23,8 @@ const CFG = Dict{Symbol, Any}(
     :compute_precision => Float32,  # field + mu reconstruction precision
     :gpu_threads => 256,
     :output_csv => nothing,         # optional duplicate table; set a path if you want CSV
-    :output_h5 => joinpath(@__DIR__, "outputs", "campaigns", "0_5", "10000000_GeV", "delta_mu2_curve.h5"),
-    :output_png => joinpath(@__DIR__, "outputs", "campaigns", "0_5", "10000000_GeV", "delta_mu2_curve.png"),
+    :output_h5 => joinpath(PIPELINE_ROOT, "outputs", "campaigns", "0_5", "10000000_GeV", "delta_mu2_curve.h5"),
+    :output_png => joinpath(PIPELINE_ROOT, "outputs", "campaigns", "0_5", "10000000_GeV", "delta_mu2_curve.png"),
     :use_usetex => false,
 )
 

@@ -45,4 +45,4 @@ fi
 
 echo "Run mode: $RUN_LABEL"
 cd "$REPO_DIR"
-exec "$JULIA_BIN" "$REPO_DIR/multimode_multienergy_cache_pipeline.jl" "${CONFIG_ARG[@]}" "${EXTRA_ARGS[@]}" "$@"
+exec "$JULIA_BIN" "$REPO_DIR/run_pipeline.jl" "${CONFIG_ARG[@]}" "${EXTRA_ARGS[@]}" "$@"

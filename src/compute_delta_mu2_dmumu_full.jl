@@ -5,7 +5,7 @@ include(joinpath(@__DIR__, "compute_delta_mu2_curve.jl"))
 using Random
 
 const COMBINED_FULL_CFG = Dict{Symbol, Any}(
-    :trajectory_h5 => joinpath(@__DIR__, "outputs", "campaigns", "0_5", "trajectory_cache","phase_space_10000000_GeV.h5"),
+    :trajectory_h5 => joinpath(PIPELINE_ROOT, "outputs", "campaigns", "0_5", "trajectory_cache","phase_space_10000000_GeV.h5"),
     :turbulence_h5 => raw"/data/multiphase/MP_WeakB_0_5tcs.h5",
     :B_paths => ("i_mag_field", "j_mag_field", "k_mag_field"),
     :box_length_pc => 200.0,
@@ -29,7 +29,7 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :min_count_per_cell => 20,
     :max_pair_visits_without_allow => 5.0e9,
     :allow_huge => true,
-    :output_dir => joinpath(@__DIR__, "outputs", "campaigns", "0_5", "10000000_GeV", "full_test"),
+    :output_dir => joinpath(PIPELINE_ROOT, "outputs", "campaigns", "0_5", "10000000_GeV", "full_test"),
     :output_h5 => nothing,
     :output_delta_png => nothing,
     :output_heatmap_png => nothing,
@@ -40,7 +40,7 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
 function print_usage()
     println("""
     Usage:
-      julia compute_delta_mu2_dmumu_full.jl [options]
+      julia src/compute_delta_mu2_dmumu_full.jl [options]
 
     This standalone postprocessor reconstructs mu(t) once per particle chunk and
     uses that same chunk to accumulate both:
@@ -143,7 +143,7 @@ function parse_cli_config(args)
             cfg[:n_mu_bins] = 8
             cfg[:min_count_per_cell] = 2
             cfg[:field_subset] = (16, 16, 16)
-            cfg[:output_dir] = joinpath(@__DIR__, "outputs", "combined_full", "smoke")
+            cfg[:output_dir] = joinpath(PIPELINE_ROOT, "outputs", "combined_full", "smoke")
         elseif startswith(argument, "--trajectory-h5=")
             cfg[:trajectory_h5] = split(argument, "=", limit=2)[2]
         elseif startswith(argument, "--turbulence-h5=")

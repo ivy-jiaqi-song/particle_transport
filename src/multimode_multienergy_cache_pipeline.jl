@@ -28,6 +28,8 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
     :cache_mode => :mu,
     :compute_dmumu => true,
     :mode_campaigns => nothing,
+    :energy_input_kind => :gev,
+    :energy_input_values => [1e5, 1e6, 1e7],
     :energies => [1e5, 1e6, 1e7],
     :delete_cache_on_success => true,
     :reuse_existing_cache => true,
@@ -70,6 +72,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :n_lag_samples => 40,
         :max_lag_steps => nothing,
         :lag_step_stride => 1,
+        :mu_bin_coordinate => :signed,
         :n_mu_bins => 24,
         :mu_min => -1.0,
         :mu_max => 1.0,
@@ -114,7 +117,95 @@ function merge_cfg(base_cfg, overrides)
 end
 
 function energy_tag(energy_GeV)
-    return string(Int(round(Float64(energy_GeV)))) * "_GeV"
+    value = Float64(energy_GeV)
+    if isfinite(value) && isapprox(value, round(value); rtol=0.0, atol=1e-9)
+        return string(Int(round(value))) * "_GeV"
+    end
+    text = replace(@sprintf("%.12g", value), "+" => "")
+    text = replace(text, "." => "p", "-" => "m")
+    return text * "_GeV"
+end
+
+function set_energy_input!(cfg, kind::Symbol, values)
+    values = Float64.(values)
+    isempty(values) && error("Energy input list cannot be empty.")
+    any(value -> !(isfinite(value) && value > 0.0), values) && error("Energy and Larmor-radius inputs must be finite positive values.")
+    cfg[:energy_input_kind] = kind
+    cfg[:energy_input_values] = values
+    cfg[:energies] = kind == :gev ? values : Float64[]
+    return nothing
+end
+
+function energy_input_summary(cfg)
+    kind = cfg[:energy_input_kind]
+    values = cfg[:energy_input_values]
+    kind == :gev && return "energies [GeV] = " * string(values)
+    kind == :larmor_box_fraction && return "r_L/L_box = " * string(values)
+    kind == :larmor_pc && return "r_L [pc] = " * string(values)
+    return string(kind) * " = " * string(values)
+end
+
+function fields_mean_B0_T(fields)
+    Bx, By, Bz = fields[1], fields[2], fields[3]
+    return Float64(mean(sqrt.(Bx .^ 2 .+ By .^ 2 .+ Bz .^ 2)))
+end
+
+function make_particle_spec(energy_GeV, energy_input_kind::Symbol, energy_input_value, energy_input_unit::AbstractString, B0_T, box_length_m)
+    radius_m = RunnerMod.energy_to_larmor_radius_m(energy_GeV, B0_T, Float64)
+    return (
+        energy_GeV = Float64(energy_GeV),
+        energy_input_kind = energy_input_kind,
+        energy_input_value = Float64(energy_input_value),
+        energy_input_unit = String(energy_input_unit),
+        larmor_radius_m = Float64(radius_m),
+        larmor_radius_pc = Float64(radius_m / RunnerMod.PC_TO_M),
+        larmor_radius_box_fraction = Float64(radius_m / box_length_m),
+    )
+end
+
+function resolve_particle_specs(cfg, fields, base_runner_cfg)
+    kind = cfg[:energy_input_kind]
+    values = cfg[:energy_input_values]
+    B0_T = fields_mean_B0_T(fields)
+    box_length_m = Float64(base_runner_cfg[:box_length_pc]) * RunnerMod.PC_TO_M
+
+    specs = []
+    for value in values
+        if kind == :gev
+            energy_GeV = Float64(value)
+            push!(specs, make_particle_spec(energy_GeV, :gev, value, "GeV", B0_T, box_length_m))
+        elseif kind == :larmor_box_fraction
+            radius_m = Float64(value) * box_length_m
+            energy_GeV = RunnerMod.larmor_radius_m_to_energy_GeV(radius_m, B0_T, Float64)
+            push!(specs, make_particle_spec(energy_GeV, :larmor_box_fraction, value, "box_fraction", B0_T, box_length_m))
+        elseif kind == :larmor_pc
+            radius_m = Float64(value) * RunnerMod.PC_TO_M
+            energy_GeV = RunnerMod.larmor_radius_m_to_energy_GeV(radius_m, B0_T, Float64)
+            push!(specs, make_particle_spec(energy_GeV, :larmor_pc, value, "pc", B0_T, box_length_m))
+        else
+            error("Unknown energy input kind: " * string(kind))
+        end
+    end
+    return specs
+end
+
+function particle_spec_cfg(spec)
+    return Dict{Symbol, Any}(
+        :energy_input_kind => spec.energy_input_kind,
+        :energy_input_value => spec.energy_input_value,
+        :energy_input_unit => spec.energy_input_unit,
+    )
+end
+
+function particle_spec_label(spec)
+    return @sprintf(
+        "%.12g GeV (input %s = %.12g %s, r_L/L_box = %.6g)",
+        spec.energy_GeV,
+        string(spec.energy_input_kind),
+        spec.energy_input_value,
+        spec.energy_input_unit,
+        spec.larmor_radius_box_fraction,
+    )
 end
 
 function cache_mode_label(cache_mode::Symbol)
@@ -376,7 +467,7 @@ function filter_campaigns(campaigns, selected_turbulences, selected_modes, selec
     return filtered
 end
 
-function filter_campaigns_by_requests(campaigns, campaign_requests, default_energies)
+function filter_campaigns_by_requests(campaigns, campaign_requests)
     campaign_requests === nothing && return nothing
 
     selected = Dict{Symbol, Any}[]
@@ -394,7 +485,10 @@ function filter_campaigns_by_requests(campaigns, campaign_requests, default_ener
 
         for campaign in matches
             copied = shallow_copy_dict(campaign)
-            copied[:energies] = get(request, :energies, default_energies)
+            if haskey(request, :energy_input_kind)
+                copied[:energy_input_kind] = request[:energy_input_kind]
+                copied[:energy_input_values] = request[:energy_input_values]
+            end
             push!(selected, copied)
         end
     end
@@ -508,9 +602,14 @@ function delete_cache_if_requested(path_h5::AbstractString, cfg)
     return false
 end
 
-function summary_row(energy_GeV, status::AbstractString, deleted::Bool, cache_path::AbstractString, combined_h5::AbstractString, note::AbstractString)
+function summary_row(spec, status::AbstractString, deleted::Bool, cache_path::AbstractString, combined_h5::AbstractString, note::AbstractString)
     return (
-        energy_GeV = Float64(energy_GeV),
+        energy_GeV = Float64(spec.energy_GeV),
+        energy_input_kind = string(spec.energy_input_kind),
+        energy_input_value = Float64(spec.energy_input_value),
+        energy_input_unit = string(spec.energy_input_unit),
+        larmor_radius_box_fraction = Float64(spec.larmor_radius_box_fraction),
+        larmor_radius_pc = Float64(spec.larmor_radius_pc),
         status = status,
         deleted = deleted,
         cache_path = cache_path,
@@ -522,12 +621,17 @@ end
 function write_summary(path::AbstractString, rows)
     ensure_parent(path)
     open(path, "w") do io
-        println(io, "energy_GeV\tstatus\tcache_deleted\tcache_path\tcombined_h5\tnote")
+        println(io, "energy_GeV\tenergy_input_kind\tenergy_input_value\tenergy_input_unit\tlarmor_radius_box_fraction\tlarmor_radius_pc\tstatus\tcache_deleted\tcache_path\tcombined_h5\tnote")
         for row in rows
             println(
                 io,
                 join((
                     @sprintf("%.6f", row.energy_GeV),
+                    row.energy_input_kind,
+                    @sprintf("%.12g", row.energy_input_value),
+                    row.energy_input_unit,
+                    @sprintf("%.12g", row.larmor_radius_box_fraction),
+                    @sprintf("%.12g", row.larmor_radius_pc),
                     row.status,
                     row.deleted ? "true" : "false",
                     row.cache_path,
@@ -586,6 +690,7 @@ function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_sav
     file["dt_s"] = Float64[dt]
     file["Omega0"] = Float64[Omega0]
     file["B0_T"] = Float64[B0]
+    RunnerMod.write_particle_scale_metadata!(file, cfg, energy_GeV, B0)
     file["n_particles"] = Int[cfg[:n_particles]]
     file["trajectory_time_stride"] = Int[cfg[:trajectory_time_stride]]
     file["boundary_mode"] = string(cfg[:boundary])
@@ -797,11 +902,47 @@ function read_mu_batch(dataset, particle_indices)
     return output
 end
 
+const CACHE_METADATA_DATASETS = (
+    "energy_GeV",
+    "dt_s",
+    "Omega0",
+    "B0_T",
+    "larmor_radius_m",
+    "larmor_radius_pc",
+    "larmor_radius_box_fraction",
+    "energy_input_kind",
+    "energy_input_value",
+    "energy_input_unit",
+    "particle_scale_note",
+    "n_particles",
+    "trajectory_time_stride",
+    "boundary_mode",
+    "position_unit",
+    "momentum_unit",
+    "cache_output_precision",
+    "trajectory_output_precision",
+    "mu_unit",
+)
+
+function copy_cache_metadata_dataset!(output_file, cache_file, dataset_name::AbstractString)
+    haskey(cache_file, dataset_name) || return nothing
+    haskey(output_file, dataset_name) && return nothing
+    output_file[dataset_name] = read(cache_file[dataset_name])
+    return nothing
+end
+
 function append_cache_metadata!(path_h5::AbstractString, cache_mode::Symbol, cache_h5::AbstractString)
     h5open(path_h5, "r+") do file
-        file["cache_mode"] = string(cache_mode)
-        file["cache_h5"] = string(cache_h5)
-        file["cache_dataset"] = cache_mode == :mu ? "mu" : "positions,momenta"
+        haskey(file, "cache_mode") || (file["cache_mode"] = string(cache_mode))
+        haskey(file, "cache_h5") || (file["cache_h5"] = string(cache_h5))
+        haskey(file, "cache_dataset") || (file["cache_dataset"] = cache_mode == :mu ? "mu" : "positions,momenta")
+        if isfile(cache_h5)
+            h5open(cache_h5, "r") do cache_file
+                for dataset_name in CACHE_METADATA_DATASETS
+                    copy_cache_metadata_dataset!(file, cache_file, dataset_name)
+                end
+            end
+        end
     end
     return nothing
 end
@@ -814,6 +955,7 @@ function run_combined_from_mu_cache(cfg)
     mkpath(dirname(cfg[:output_collapsed_png]))
 
     mu_edges, mu_centers = CombinedFullMod.build_mu_edges_full(cfg)
+    mu_bin_coord = CombinedFullMod.mu_bin_coordinate(cfg)
 
     h5open(cfg[:cache_h5], "r") do cache_file
         mu_dataset = cache_file["mu"]
@@ -889,6 +1031,7 @@ function run_combined_from_mu_cache(cfg)
                 dmumu_counts,
                 dmumu_sum_delta,
                 dmumu_sum_delta2,
+                mu_bin_coord,
             )
         end
 
@@ -941,7 +1084,7 @@ function run_combined_from_mu_cache(cfg)
         CombinedFullMod.plot_delta_mu2(delta_df, cfg[:output_delta_png]; use_usetex=cfg[:use_usetex])
         println("Saved delta_mu2 plot to ", cfg[:output_delta_png])
 
-        CombinedFullMod.plot_dmumu_heatmap_full(cfg[:output_heatmap_png], mu_edges, tau_norm, dmumu_centered_norm; use_usetex=cfg[:use_usetex])
+        CombinedFullMod.plot_dmumu_heatmap_full(cfg[:output_heatmap_png], mu_edges, tau_norm, dmumu_centered_norm; use_usetex=cfg[:use_usetex], mu_bin_coordinate=mu_bin_coord)
         println("Saved D_mumu heatmap to ", cfg[:output_heatmap_png])
 
         CombinedFullMod.plot_collapsed_dmumu_full(
@@ -952,6 +1095,7 @@ function run_combined_from_mu_cache(cfg)
             collapsed_raw_norm_count_weighted,
             collapsed_centered_norm_count_weighted;
             use_usetex=cfg[:use_usetex],
+            mu_bin_coordinate=mu_bin_coord,
         )
         println("Saved D_mumu tau-average plot to ", cfg[:output_collapsed_png])
     end
@@ -959,18 +1103,19 @@ function run_combined_from_mu_cache(cfg)
     return nothing
 end
 
-function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
+function run_energy_pipeline!(cfg, fields, base_runner_cfg, spec)
+    energy_GeV = spec.energy_GeV
     paths = build_energy_paths(cfg, energy_GeV)
     mkpath(paths.cache_dir)
     mkpath(paths.science_dir)
 
     println()
-    println("=== Energy ", energy_GeV, " GeV ===")
+    println("=== Particle scale ", particle_spec_label(spec), " ===")
     if !cfg[:compute_dmumu] && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         println("Cache already verified; D_mumu disabled for energy ", energy_GeV, " GeV")
         return summary_row(
-            energy_GeV,
+            spec,
             "skipped_existing_cache",
             false,
             paths.cache_h5,
@@ -983,11 +1128,12 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         deleted = false
         if isfile(paths.cache_h5)
             verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
+            append_cache_metadata!(paths.combined_h5, cfg[:cache_mode], paths.cache_h5)
             deleted = delete_cache_if_requested(paths.cache_h5, cfg)
         end
         println("Combined outputs already verified; skipping energy ", energy_GeV, " GeV")
         return summary_row(
-            energy_GeV,
+            spec,
             "skipped_existing_outputs",
             deleted,
             paths.cache_h5,
@@ -1001,14 +1147,20 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
     else
         if cfg[:cache_mode] == :phase_space
-            runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(
-                :output_dir => paths.cache_dir,
-                :energies => [energy_GeV],
-            ))
+            runner_cfg = merge_cfg(
+                base_runner_cfg,
+                merge_cfg(
+                    particle_spec_cfg(spec),
+                    Dict{Symbol, Any}(
+                        :output_dir => paths.cache_dir,
+                        :energies => [energy_GeV],
+                    ),
+                ),
+            )
             runner_result = RunnerMod.run_gpu_ensemble(runner_cfg, fields; energy_GeV=energy_GeV)
             verify_phase_space_cache_h5(runner_result.phase_space_path)
         elseif cfg[:cache_mode] == :mu
-            run_mu_cache_ensemble(base_runner_cfg, fields, paths.cache_h5; energy_GeV=energy_GeV)
+            run_mu_cache_ensemble(merge_cfg(base_runner_cfg, particle_spec_cfg(spec)), fields, paths.cache_h5; energy_GeV=energy_GeV)
             verify_mu_cache_h5(paths.cache_h5)
         else
             error("Unknown cache mode: " * string(cfg[:cache_mode]))
@@ -1019,7 +1171,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         println("D_mumu disabled; keeping verified cache file ", paths.cache_h5)
         return summary_row(
-            energy_GeV,
+            spec,
             "cache_only",
             false,
             paths.cache_h5,
@@ -1056,7 +1208,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png)
     deleted = delete_cache_if_requested(paths.cache_h5, cfg)
     return summary_row(
-        energy_GeV,
+        spec,
         "ok",
         deleted,
         paths.cache_h5,
@@ -1082,20 +1234,23 @@ function run_campaign(cfg)
     println("  campaign root            = ", cfg[:campaign_root])
     println("  turbulence H5            = ", cfg[:turbulence_h5])
     println("  cache mode               = ", cfg[:cache_mode])
+    println("  particle input           = ", energy_input_summary(cfg))
     println("Loading turbulence fields once for trajectory generation")
     fields = RunnerMod.load_static_fields(base_runner_cfg, base_runner_cfg[:precision])
+    particle_specs = resolve_particle_specs(cfg, fields, base_runner_cfg)
+    println("  resolved particle scales = ", [particle_spec_label(spec) for spec in particle_specs])
 
     summary_rows = Any[]
     summary_path = joinpath(cfg[:campaign_root], "campaign_summary.tsv")
-    for energy_GeV in cfg[:energies]
+    for spec in particle_specs
         try
-            push!(summary_rows, run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV))
+            push!(summary_rows, run_energy_pipeline!(cfg, fields, base_runner_cfg, spec))
             write_summary(summary_path, summary_rows)
         catch error_instance
             note = sprint(showerror, error_instance, catch_backtrace())
-            paths = build_energy_paths(cfg, energy_GeV)
+            paths = build_energy_paths(cfg, spec.energy_GeV)
             push!(summary_rows, summary_row(
-                energy_GeV,
+                spec,
                 "error",
                 false,
                 paths.cache_h5,
@@ -1116,13 +1271,17 @@ function run_campaign(cfg)
 end
 
 function materialize_campaign_cfg(cfg, campaign_spec)
+    energy_input_kind = get(campaign_spec, :energy_input_kind, cfg[:energy_input_kind])
+    energy_input_values = get(campaign_spec, :energy_input_values, cfg[:energy_input_values])
     campaign_cfg = Dict{Symbol, Any}(
         :campaign_tag => campaign_spec[:campaign_tag],
         :campaign_root => campaign_spec[:campaign_root],
         :turbulence_h5 => campaign_spec[:turbulence_h5],
         :cache_mode => cfg[:cache_mode],
         :compute_dmumu => cfg[:compute_dmumu],
-        :energies => get(campaign_spec, :energies, cfg[:energies]),
+        :energy_input_kind => energy_input_kind,
+        :energy_input_values => energy_input_values,
+        :energies => energy_input_kind == :gev ? energy_input_values : Float64[],
         :delete_cache_on_success => cfg[:delete_cache_on_success],
         :reuse_existing_cache => cfg[:reuse_existing_cache],
         :skip_completed_outputs => cfg[:skip_completed_outputs],
@@ -1233,6 +1392,44 @@ function config_energy_values(value, key_name::AbstractString)
     error(key_name * " must be a string or array of numbers.")
 end
 
+function config_positive_float_values(value, key_name::AbstractString)
+    values = config_energy_values(value, key_name)
+    any(item -> !(isfinite(item) && item > 0.0), values) && error(key_name * " must contain finite positive values.")
+    return values
+end
+
+function maybe_singleton_config_value(section, plural_key::AbstractString, singular_key::AbstractString, section_name::AbstractString)
+    has_plural = haskey(section, plural_key)
+    has_singular = haskey(section, singular_key)
+    has_plural && has_singular && error(section_name * " cannot define both " * plural_key * " and " * singular_key * ".")
+    has_plural && return section[plural_key], section_name * "." * plural_key
+    has_singular && return [section[singular_key]], section_name * "." * singular_key
+    return nothing
+end
+
+function config_energy_input_from_section(section, section_name::AbstractString; allow_singular::Bool=false)
+    candidates = []
+
+    if haskey(section, "energies_gev")
+        push!(candidates, (:gev, section["energies_gev"], section_name * ".energies_gev"))
+    end
+    if allow_singular && haskey(section, "energy_gev")
+        push!(candidates, (:gev, [section["energy_gev"]], section_name * ".energy_gev"))
+    end
+
+    box_fraction_value = maybe_singleton_config_value(section, "larmor_radii_box_fraction", "larmor_radius_box_fraction", section_name)
+    box_fraction_value !== nothing && push!(candidates, (:larmor_box_fraction, box_fraction_value[1], box_fraction_value[2]))
+
+    pc_value = maybe_singleton_config_value(section, "larmor_radii_pc", "larmor_radius_pc", section_name)
+    pc_value !== nothing && push!(candidates, (:larmor_pc, pc_value[1], pc_value[2]))
+
+    length(candidates) > 1 && error(section_name * " must define only one particle energy input: energies_gev, larmor_radii_box_fraction, or larmor_radii_pc.")
+    isempty(candidates) && return nothing
+
+    kind, raw_values, key_name = first(candidates)
+    return (kind = kind, values = config_positive_float_values(raw_values, key_name))
+end
+
 function config_tuple3_strings(value, key_name::AbstractString)
     values = if value isa AbstractString
         split_csv_selector(value; flag_name=key_name)
@@ -1281,6 +1478,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key == :field_subset && return config_field_subset(value, key_name)
     key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
     key in (:boundary, :compute_backend, :particle_selection, :lag_mode) && return config_symbol(value, key_name)
+    key == :mu_bin_coordinate && return CombinedFullMod.parse_mu_bin_coordinate(value)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
     return value
@@ -1317,17 +1515,30 @@ function config_campaign_requests(value, key_name::AbstractString)
     for (index, item) in enumerate(value)
         item isa AbstractDict || error(key_name * " entries must be TOML tables.")
         entry_name = key_name * "[" * string(index) * "]"
-        validate_toml_keys(item, Set(["mode", "campaign", "energies_gev", "energy_gev"]), entry_name)
+        validate_toml_keys(
+            item,
+            Set([
+                "mode",
+                "campaign",
+                "energies_gev",
+                "energy_gev",
+                "larmor_radii_box_fraction",
+                "larmor_radius_box_fraction",
+                "larmor_radii_pc",
+                "larmor_radius_pc",
+            ]),
+            entry_name,
+        )
 
         request = Dict{Symbol, Any}()
         haskey(item, "mode") && (request[:mode_name] = strip(String(item["mode"])))
         haskey(item, "campaign") && (request[:campaign_tag] = normalize_campaign_selector(String(item["campaign"])))
         isempty(request) && error(entry_name * " must define mode or campaign.")
 
-        if haskey(item, "energies_gev")
-            request[:energies] = config_energy_values(item["energies_gev"], entry_name * ".energies_gev")
-        elseif haskey(item, "energy_gev")
-            request[:energies] = config_energy_values([item["energy_gev"]], entry_name * ".energy_gev")
+        energy_input = config_energy_input_from_section(item, entry_name; allow_singular=true)
+        if energy_input !== nothing
+            request[:energy_input_kind] = energy_input.kind
+            request[:energy_input_values] = energy_input.values
         end
 
         push!(requests, request)
@@ -1397,6 +1608,10 @@ function apply_toml_config!(cfg, config_path::AbstractString)
             "mode_decomposition_available",
             "available_modes",
             "energies_gev",
+            "larmor_radii_box_fraction",
+            "larmor_radius_box_fraction",
+            "larmor_radii_pc",
+            "larmor_radius_pc",
             "turbulence",
             "modes",
             "mode",
@@ -1416,7 +1631,8 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     haskey(run, "compute_dmumu") && (cfg[:compute_dmumu] = config_bool(run["compute_dmumu"], "[run].compute_dmumu"))
     haskey(run, "mode_decomposition_available") && (cfg[:mode_decomposition_available] = config_bool(run["mode_decomposition_available"], "[run].mode_decomposition_available"))
     haskey(run, "available_modes") && (cfg[:available_modes] = config_available_modes(run["available_modes"], "[run].available_modes"))
-    haskey(run, "energies_gev") && (cfg[:energies] = config_energy_values(run["energies_gev"], "[run].energies_gev"))
+    energy_input = config_energy_input_from_section(run, "[run]")
+    energy_input !== nothing && set_energy_input!(cfg, energy_input.kind, energy_input.values)
     haskey(run, "turbulence") && (cfg[:selected_turbulences] = config_string_selector(run["turbulence"], "[run].turbulence"))
     haskey(run, "modes") && (cfg[:selected_modes] = config_string_selector(run["modes"], "[run].modes"))
     haskey(run, "mode") && (cfg[:selected_modes] = config_string_selector(run["mode"], "[run].mode"))
@@ -1541,7 +1757,7 @@ function runtime_config()
     campaign_requests = get(cfg, :campaign_requests, nothing)
 
     if smoke_run
-        cfg[:energies] = [1e5, 3e5]
+        set_energy_input!(cfg, :gev, [1e5, 3e5])
         selected_turbulences = nothing
         selected_modes = nothing
         selected_campaigns = [first(all_campaigns)[:campaign_tag]]
@@ -1582,9 +1798,19 @@ function runtime_config()
             selected_campaigns = parse_campaign_selector(split(argument, "=", limit=2)[2])
             cli_requested_campaign_selection = true
         elseif startswith(argument, "--energy=")
-            cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energy")
+            set_energy_input!(cfg, :gev, config_positive_float_values(split(argument, "=", limit=2)[2], "--energy"))
         elseif startswith(argument, "--energies=")
-            cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energies")
+            set_energy_input!(cfg, :gev, config_positive_float_values(split(argument, "=", limit=2)[2], "--energies"))
+        elseif startswith(argument, "--larmor-radius-box-fraction=")
+            set_energy_input!(cfg, :larmor_box_fraction, config_positive_float_values(split(argument, "=", limit=2)[2], "--larmor-radius-box-fraction"))
+        elseif startswith(argument, "--larmor-radii-box-fraction=")
+            set_energy_input!(cfg, :larmor_box_fraction, config_positive_float_values(split(argument, "=", limit=2)[2], "--larmor-radii-box-fraction"))
+        elseif startswith(argument, "--larmor-radius-pc=")
+            set_energy_input!(cfg, :larmor_pc, config_positive_float_values(split(argument, "=", limit=2)[2], "--larmor-radius-pc"))
+        elseif startswith(argument, "--larmor-radii-pc=")
+            set_energy_input!(cfg, :larmor_pc, config_positive_float_values(split(argument, "=", limit=2)[2], "--larmor-radii-pc"))
+        elseif startswith(argument, "--mu-bin-coordinate=")
+            cfg[:combined_overrides][:mu_bin_coordinate] = CombinedFullMod.parse_mu_bin_coordinate(split(argument, "=", limit=2)[2])
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)
@@ -1609,7 +1835,7 @@ function runtime_config()
     validate_selected_values(all_campaigns, selected_modes, :mode_name, "--mode")
     validate_selected_values(all_campaigns, selected_campaigns, :campaign_tag, "--campaign")
 
-    requested_campaigns = filter_campaigns_by_requests(all_campaigns, campaign_requests, cfg[:energies])
+    requested_campaigns = filter_campaigns_by_requests(all_campaigns, campaign_requests)
     cfg[:mode_campaigns] = requested_campaigns === nothing ?
         filter_campaigns(all_campaigns, selected_turbulences, selected_modes, selected_campaigns) :
         requested_campaigns
@@ -1648,7 +1874,7 @@ function main()
     println("  campaigns                = ", campaign_tags(cfg))
     println("  cache mode               = ", cfg[:cache_mode])
     println("  compute D_mumu           = ", cfg[:compute_dmumu])
-    println("  energies [GeV]           = ", cfg[:energies])
+    println("  particle input           = ", energy_input_summary(cfg))
     println("  output root              = ", cfg[:output_root])
     println("  delete cache             = ", cfg[:delete_cache_on_success])
     println("  reuse existing cache     = ", cfg[:reuse_existing_cache])

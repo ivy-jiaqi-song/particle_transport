@@ -1,5 +1,6 @@
 using HDF5
 using CUDA
+using Printf
 using Random
 using Statistics
 
@@ -44,6 +45,38 @@ end
 function energy_to_speed(E_GeV, ::Type{T}) where {T<:AbstractFloat}
     gamma = energy_to_gamma(E_GeV, T)
     return T(C_LIGHT) * sqrt(one(T) - inv(gamma^2))
+end
+
+function energy_to_larmor_radius_m(E_GeV, B0_T, ::Type{T}) where {T<:AbstractFloat}
+    B0 = T(B0_T)
+    B0 > zero(T) || error("B0_T must be positive to compute Larmor radius.")
+    gamma = energy_to_gamma(E_GeV, T)
+    speed = energy_to_speed(E_GeV, T)
+    return gamma * T(M_P) * speed / (T(Q_E) * B0)
+end
+
+function larmor_radius_m_to_energy_GeV(radius_m, B0_T, ::Type{T}) where {T<:AbstractFloat}
+    radius = T(radius_m)
+    B0 = T(B0_T)
+    radius > zero(T) || error("Larmor radius must be positive.")
+    B0 > zero(T) || error("B0_T must be positive to convert Larmor radius to energy.")
+    momentum = T(Q_E) * B0 * radius
+    gamma = sqrt(one(T) + (momentum / (T(M_P) * T(C_LIGHT)))^2)
+    kinetic_joule = (gamma - one(T)) * T(M_P) * T(C_LIGHT)^2
+    return kinetic_joule / T(GEV_TO_J)
+end
+
+function write_particle_scale_metadata!(file, cfg, energy_GeV, B0)
+    radius_m = energy_to_larmor_radius_m(energy_GeV, B0, Float64)
+    box_length_m = Float64(cfg[:box_length_pc]) * PC_TO_M
+    file["larmor_radius_m"] = Float64[radius_m]
+    file["larmor_radius_pc"] = Float64[radius_m / PC_TO_M]
+    file["larmor_radius_box_fraction"] = Float64[radius_m / box_length_m]
+    file["energy_input_kind"] = string(get(cfg, :energy_input_kind, :gev))
+    file["energy_input_value"] = Float64[get(cfg, :energy_input_value, Float64(energy_GeV))]
+    file["energy_input_unit"] = string(get(cfg, :energy_input_unit, "GeV"))
+    file["particle_scale_note"] = "Larmor radius uses r_L = gamma*m*v/(q*B0), with B0 equal to the spatial mean magnetic-field magnitude used for Omega0."
+    return nothing
 end
 
 function rand_unit_vector(rng, ::Type{T}) where {T<:AbstractFloat}
@@ -310,6 +343,7 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     file["dt_s"] = Float64[dt]
     file["Omega0"] = Float64[Omega0]
     file["B0_T"] = Float64[B0]
+    write_particle_scale_metadata!(file, cfg, energy_GeV, B0)
     file["n_particles"] = Int[cfg[:n_particles]]
     file["trajectory_time_stride"] = Int[cfg[:trajectory_time_stride]]
     file["boundary_mode"] = string(cfg[:boundary])
@@ -319,10 +353,21 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     close(file)
 end
 
+function energy_tag(E)
+    value = Float64(E)
+    if isfinite(value) && isapprox(value, round(value); rtol=0.0, atol=1e-9)
+        return string(Int(round(value))) * "_GeV"
+    end
+    text = replace(@sprintf("%.12g", value), "+" => "")
+    text = replace(text, "." => "p", "-" => "m")
+    return text * "_GeV"
+end
+
 function output_paths(cfg, E)
-    tag = string(Int(E)) * "_GeV"
+    tag = energy_tag(E)
     outdir = cfg[:output_dir]
-    return (h5 = joinpath(outdir, "phase_space_" * tag * ".h5"), label = "E = " * string(Int(E)) * " GeV")
+    label = "E = " * (@sprintf("%.12g", Float64(E))) * " GeV"
+    return (h5 = joinpath(outdir, "phase_space_" * tag * ".h5"), label = label)
 end
 
 function run_gpu_ensemble(cfg, fields; energy_GeV)

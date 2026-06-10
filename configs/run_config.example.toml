@@ -37,6 +37,13 @@ available_modes = ["alfven", "fast", "slow"]
 
 # Full repeat: every selected energy for every selected mode.
 energies_gev = [1e5, 1e6, 1e7]
+
+# Paper-style particle scale: Maiti et al. use r_L = 0.04 L_box.
+# Use this instead of energies_gev when matching that setup.
+# larmor_radii_box_fraction = [0.04]
+#
+# A physical-radius input is also accepted when preferred:
+# larmor_radii_pc = [8.0]
 modes = "all"
 
 # Selective campaign example. Uncomment to run only specific mode/energy pairs.
@@ -104,6 +111,7 @@ lag_step_stride = 1
 
 # D_mumu binning and safety controls.
 n_mu_bins = 24
+mu_bin_coordinate = "signed"  # "absolute" bins by |mu_0|; use with mu_min=0, mu_max=1 for Figure-1-style comparisons.
 mu_min = -1.0
 mu_max = 1.0
 min_count_per_cell = 20

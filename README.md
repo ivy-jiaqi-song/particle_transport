@@ -79,8 +79,11 @@ The current public config layout is:
   - `mode_decomposition_available`: `true` means files such as
     `<stem>_alfven.h5`, `<stem>_fast.h5`, and `<stem>_slow.h5` exist. `false`
     means only the total input file is used.
-  - `modes` and `energies_gev`: full repeat selection.
-  - `[[run.campaigns]]`: optional selective mode/energy campaign entries.
+  - `modes` and one particle-scale input: `energies_gev`,
+    `larmor_radii_box_fraction`, or `larmor_radii_pc`.
+  - `[[run.campaigns]]`: optional selective mode/particle-scale campaign
+    entries. `r_L/L_box = 0.04` matches the dimensionless Larmor radius used
+    in Maiti et al. for their Figure 1 setup.
 
 - `[particles]`
   - Physical trajectory settings: field dataset names, velocity unit, box size,
@@ -94,6 +97,8 @@ The current public config layout is:
     `particles = "all"` uses all cached particles. Lag settings still apply in
     both cases.
   - Lag sampling, mu binning, backend, chunk size, and safety-limit controls.
+  - `mu_bin_coordinate = "absolute"` bins by `|mu_0|` on `[0, 1]`; this is the
+    paper-style choice for Maiti et al. Figure 1 comparisons.
 
 Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
 but new configs should use the generic `[input]` form.
@@ -108,6 +113,21 @@ mode_decomposition_available = true
 available_modes = ["alfven", "fast", "slow"]
 energies_gev = [1e5, 1e6, 1e7]
 modes = "all"
+```
+
+Use the paper-style dimensionless Larmor radius instead of GeV inputs:
+
+```toml
+[run]
+mode_decomposition_available = true
+available_modes = ["alfven", "fast", "slow"]
+larmor_radii_box_fraction = [0.04]
+modes = "all"
+
+[dmumu]
+mu_bin_coordinate = "absolute"
+mu_min = 0.0
+mu_max = 1.0
 ```
 
 Run only selected mode/energy pairs:
@@ -179,6 +199,9 @@ Useful runtime flags:
 - `--modes=alfven,fast` or `--mode=alfven`
 - `--campaign=mp/0_5/alfven`
 - `--energy=1e5` or `--energies=1e5,1e6,1e7`
+- `--larmor-radius-box-fraction=0.04` or `--larmor-radii-box-fraction=0.04,0.08`
+- `--larmor-radius-pc=8.0` or `--larmor-radii-pc=8.0,16.0`
+- `--mu-bin-coordinate=absolute` for paper-style `|mu_0|` D_mumu bins
 - `--cache-mode=mu` or `--cache-mode=phase-space`
 - `--compute-dmumu` or `--no-compute-dmumu`
 - `--keep-caches`
@@ -226,6 +249,17 @@ Generate fixed-energy mode comparisons:
 ```bash
 python compare_transport_products.py --figure-set=modes --turbulence=0_5 --energy=1e5
 ```
+
+Generate a Figure-1-style mode comparison after an `r_L/L_box = 0.04`,
+absolute-mu run:
+
+```bash
+python compare_transport_products.py --figure-set=modes --turbulence=0_5 \
+  --dmumu-variant=raw --plot-kind=dmumu --mu-coordinate=absolute
+```
+
+Add `--dmumu-tau=VALUE` to plot the nearest stored `D_mumu(mu,tau)` slice, or
+`--dmumu-tau-min=MIN --dmumu-tau-max=MAX` to average over a selected tau range.
 
 Generate energy scans:
 

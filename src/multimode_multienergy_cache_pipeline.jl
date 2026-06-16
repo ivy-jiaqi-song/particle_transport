@@ -66,7 +66,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :particle_selection => :block_random,
         :particle_seed => 20260423,
         :particle_block_size => 128,
+        :dmumu_start_mode => :sliding,
         :lag_mode => :uniform_samples,
+        :min_lag_steps => 1,
         :n_lag_samples => 40,
         :max_lag_steps => nothing,
         :lag_step_stride => 1,
@@ -489,9 +491,57 @@ function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractStr
     return true
 end
 
-function compact_outputs_complete(paths)
+function h5_scalar_value_or(file, dataset_name::AbstractString, default)
+    haskey(file, dataset_name) || return default
+    value = read(file[dataset_name])
+    if value isa AbstractArray
+        isempty(value) && return default
+        return first(value)
+    end
+    return value
+end
+
+function h5_scalar_string_or(file, dataset_name::AbstractString, default::AbstractString)
+    value = h5_scalar_value_or(file, dataset_name, default)
+    return string(value)
+end
+
+function h5_scalar_int_or(file, dataset_name::AbstractString, default::Integer)
+    value = h5_scalar_value_or(file, dataset_name, default)
+    value isa Integer && return Int(value)
+    return parse(Int, string(value))
+end
+
+function combined_outputs_match_requested(path_h5::AbstractString, cfg)
+    h5open(path_h5, "r") do file
+        stored_start_mode = CombinedFullMod.parse_dmumu_start_mode(h5_scalar_string_or(file, "dmumu_start_mode", "sliding"))
+        stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
+        stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
+        stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
+        stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
+        stored_lag_step_stride = h5_scalar_int_or(file, "lag_step_stride", 1)
+        stored_max_lag_steps = h5_scalar_int_or(file, "max_lag_steps", -1)
+        stored_n_mu_bins = h5_scalar_int_or(file, "n_mu_bins", Int(cfg[:n_mu_bins]))
+        stored_mu_edges = read(file["dmumu"]["mu_edges"])
+
+        requested_max_lag_steps = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
+        return stored_start_mode == CombinedFullMod.dmumu_start_mode(cfg) &&
+               stored_lag_mode == cfg[:lag_mode] &&
+               stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
+               stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
+               stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
+               stored_max_lag_steps == requested_max_lag_steps &&
+               stored_n_mu_bins == Int(cfg[:n_mu_bins]) &&
+               length(stored_mu_edges) == Int(cfg[:n_mu_bins]) + 1 &&
+               isapprox(first(stored_mu_edges), Float64(cfg[:mu_min]); atol=0.0, rtol=0.0) &&
+               isapprox(last(stored_mu_edges), Float64(cfg[:mu_max]); atol=0.0, rtol=0.0)
+    end
+end
+
+function compact_outputs_complete(paths, cfg)
     try
         verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png)
+        combined_outputs_match_requested(paths.combined_h5, cfg) || return false
         return true
     catch
         return false
@@ -814,6 +864,7 @@ function run_combined_from_mu_cache(cfg)
     mkpath(dirname(cfg[:output_collapsed_png]))
 
     mu_edges, mu_centers = CombinedFullMod.build_mu_edges_full(cfg)
+    start_mode = CombinedFullMod.dmumu_start_mode(cfg)
 
     h5open(cfg[:cache_h5], "r") do cache_file
         mu_dataset = cache_file["mu"]
@@ -862,10 +913,11 @@ function run_combined_from_mu_cache(cfg)
         end
         println("Saved steps: ", nsteps)
         println("Lag count: ", n_lags, " from ", first(lag_steps), " to ", last(lag_steps))
+        println("D_mumu start mode: ", start_mode)
         println("Mu bins: ", n_bins)
         println("Particle chunk: ", chunk_size)
         println("Chunks: ", nchunks)
-        println("Full-pair accumulation backend: cpu")
+        println("D_mumu accumulation backend: cpu")
         println("Julia threads: ", Threads.nthreads(), " active pool, max thread id ", Threads.maxthreadid())
 
         for chunk_id in 1:nchunks
@@ -877,7 +929,7 @@ function run_combined_from_mu_cache(cfg)
             mu_batch = read_mu_batch(mu_dataset, chunk_indices)
             mu_chunk = permutedims(mu_batch, (2, 1))
 
-            CombinedFullMod.process_mu_chunk_full_pairs_cpu!(
+            CombinedFullMod.process_mu_chunk_dmumu_cpu!(
                 mu_chunk,
                 lag_steps,
                 mu_edges,
@@ -889,6 +941,7 @@ function run_combined_from_mu_cache(cfg)
                 dmumu_counts,
                 dmumu_sum_delta,
                 dmumu_sum_delta2,
+                start_mode,
             )
         end
 
@@ -963,6 +1016,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     paths = build_energy_paths(cfg, energy_GeV)
     mkpath(paths.cache_dir)
     mkpath(paths.science_dir)
+    requested_analysis_cfg = merge_cfg(CombinedFullMod.COMBINED_FULL_CFG, cfg[:combined_overrides])
 
     println()
     println("=== Energy ", energy_GeV, " GeV ===")
@@ -979,7 +1033,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         )
     end
 
-    if cfg[:skip_completed_outputs] && compact_outputs_complete(paths)
+    if cfg[:skip_completed_outputs] && compact_outputs_complete(paths, requested_analysis_cfg)
         deleted = false
         if isfile(paths.cache_h5)
             verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
@@ -1029,20 +1083,17 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     end
 
     analysis_cfg = merge_cfg(
-        CombinedFullMod.COMBINED_FULL_CFG,
-        merge_cfg(
-            cfg[:combined_overrides],
-            Dict{Symbol, Any}(
-                :trajectory_h5 => paths.cache_h5,
-                :cache_h5 => paths.cache_h5,
-                :cache_mode => cfg[:cache_mode],
-                :turbulence_h5 => cfg[:turbulence_h5],
-                :output_dir => paths.science_dir,
-                :output_h5 => paths.combined_h5,
-                :output_delta_png => paths.delta_png,
-                :output_heatmap_png => paths.dmumu_heatmap_png,
-                :output_collapsed_png => paths.dmumu_collapsed_png,
-            ),
+        requested_analysis_cfg,
+        Dict{Symbol, Any}(
+            :trajectory_h5 => paths.cache_h5,
+            :cache_h5 => paths.cache_h5,
+            :cache_mode => cfg[:cache_mode],
+            :turbulence_h5 => cfg[:turbulence_h5],
+            :output_dir => paths.science_dir,
+            :output_h5 => paths.combined_h5,
+            :output_delta_png => paths.delta_png,
+            :output_heatmap_png => paths.dmumu_heatmap_png,
+            :output_collapsed_png => paths.dmumu_collapsed_png,
         ),
     )
 
@@ -1280,7 +1331,9 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
     key == :field_subset && return config_field_subset(value, key_name)
     key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
-    key in (:boundary, :compute_backend, :particle_selection, :lag_mode) && return config_symbol(value, key_name)
+    key in (:boundary, :compute_backend, :particle_selection) && return config_symbol(value, key_name)
+    key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
+    key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
     return value
@@ -1560,6 +1613,8 @@ function runtime_config()
             :first_particle => 1,
             :n_particles_to_use => 64,
             :particle_selection => :range,
+            :dmumu_start_mode => :sliding,
+            :min_lag_steps => 1,
             :n_lag_samples => 8,
             :max_lag_steps => 20,
             :n_mu_bins => 8,
@@ -1585,6 +1640,18 @@ function runtime_config()
             cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energy")
         elseif startswith(argument, "--energies=")
             cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energies")
+        elseif startswith(argument, "--dmumu-start-mode=")
+            cfg[:combined_overrides][:dmumu_start_mode] = CombinedFullMod.parse_dmumu_start_mode(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--min-lag-steps=")
+            cfg[:combined_overrides][:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-mode=")
+            cfg[:combined_overrides][:lag_mode] = CombinedFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--n-lag-samples=")
+            cfg[:combined_overrides][:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-step-stride=")
+            cfg[:combined_overrides][:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--max-lag-steps=")
+            cfg[:combined_overrides][:max_lag_steps] = config_maybe_int(split(argument, "=", limit=2)[2], "--max-lag-steps")
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)

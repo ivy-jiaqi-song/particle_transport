@@ -19,7 +19,9 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :particle_selection => :block_random,
     :particle_seed => 20260423,
     :particle_block_size => 128,
+    :dmumu_start_mode => :sliding,
     :lag_mode => :uniform_samples,
+    :min_lag_steps => 1,
     :n_lag_samples => 40,
     :max_lag_steps => nothing,
     :lag_step_stride => 1,
@@ -45,10 +47,11 @@ function print_usage()
     This standalone postprocessor reconstructs mu(t) once per particle chunk and
     uses that same chunk to accumulate both:
       - global <(Delta mu)^2>(tau)
-      - full-pair D_mumu(mu,tau) and tau-averaged D_mumu(mu)
+      - D_mumu(mu,tau) and tau-averaged D_mumu(mu)
 
-    Important: D_mumu is exact over every selected particle and every valid
-    start time for each selected lag. It does not randomly sample pairs.
+    Important: sliding D_mumu uses every valid start time for each selected lag.
+    Injection mode uses only mu(0) -> mu(tau) for each selected particle and lag.
+    Neither mode randomly samples pairs.
 
     Common options:
       --trajectory-h5=PATH
@@ -61,6 +64,8 @@ function print_usage()
       --particle-seed=N
       --particle-block-size=N
       --particle-chunk-size=N
+      --dmumu-start-mode=sliding|injection
+      --min-lag-steps=N
       --n-lag-samples=N
       --max-lag-steps=N|none
       --lag-mode=uniform|stride
@@ -71,7 +76,7 @@ function print_usage()
       --smoke
 
     Safety:
-      Large exact full-pair runs are blocked unless --allow-huge is supplied.
+      Large D_mumu runs are blocked unless --allow-huge is supplied.
     """)
 end
 
@@ -115,13 +120,24 @@ function parse_precision(value::AbstractString)
 end
 
 function parse_lag_mode(value::AbstractString)
-    mode = Symbol(lowercase(strip(value)))
+    mode = Symbol(replace(lowercase(strip(value)), "-" => "_"))
     if mode == :uniform
         return :uniform_samples
     elseif mode in (:uniform_samples, :stride)
         return mode
     end
     error("--lag-mode must be uniform or stride")
+end
+
+function parse_dmumu_start_mode(value)
+    mode = Symbol(replace(lowercase(strip(String(value))), "-" => "_"))
+    mode in (:sliding, :sliding_window, :pair_start, :current) && return :sliding
+    mode in (:injection, :initial, :t0, :initial_particle) && return :injection
+    error("dmumu_start_mode must be sliding or injection.")
+end
+
+function dmumu_start_mode(cfg)
+    return parse_dmumu_start_mode(get(cfg, :dmumu_start_mode, :sliding))
 end
 
 function parse_cli_config(args)
@@ -137,7 +153,9 @@ function parse_cli_config(args)
             cfg[:n_particles_to_use] = 8
             cfg[:particle_chunk_size] = 4
             cfg[:particle_selection] = :range
+            cfg[:dmumu_start_mode] = :sliding
             cfg[:lag_mode] = :uniform_samples
+            cfg[:min_lag_steps] = 1
             cfg[:n_lag_samples] = 5
             cfg[:max_lag_steps] = 20
             cfg[:n_mu_bins] = 8
@@ -166,6 +184,10 @@ function parse_cli_config(args)
             cfg[:particle_block_size] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--particle-chunk-size=")
             cfg[:particle_chunk_size] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-start-mode=")
+            cfg[:dmumu_start_mode] = parse_dmumu_start_mode(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--min-lag-steps=")
+            cfg[:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-lag-samples=")
             cfg[:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--max-lag-steps=")
@@ -198,16 +220,17 @@ function parse_cli_config(args)
 end
 
 function build_selected_lag_steps(nsteps::Integer, cfg)
+    min_lag = max(1, Int(get(cfg, :min_lag_steps, 1)))
     max_lag = cfg[:max_lag_steps] === nothing ? nsteps - 1 : min(Int(cfg[:max_lag_steps]), nsteps - 1)
-    max_lag >= 1 || error("Need at least two saved trajectory steps.")
+    max_lag >= min_lag || error("No lag steps selected. Check min_lag_steps, max_lag_steps, and saved trajectory length.")
 
     if cfg[:lag_mode] == :uniform_samples
-        n_lags = min(Int(cfg[:n_lag_samples]), max_lag)
-        return unique(round.(Int, range(1, max_lag, length=n_lags)))
+        n_lags = min(Int(cfg[:n_lag_samples]), max_lag - min_lag + 1)
+        return unique(round.(Int, range(min_lag, max_lag, length=n_lags)))
     elseif cfg[:lag_mode] == :stride
         stride = Int(cfg[:lag_step_stride])
         stride >= 1 || error("lag_step_stride must be >= 1")
-        return collect(1:stride:max_lag)
+        return collect(min_lag:stride:max_lag)
     end
 
     error("Unknown lag_mode: $(cfg[:lag_mode])")
@@ -247,19 +270,24 @@ function format_count(value::Integer)
     return join(chunks, "_")
 end
 
-function estimate_pair_visits(nsteps::Integer, selected_particle_count::Integer, lag_steps)
-    visits_per_particle = sum(nsteps - lag_step for lag_step in lag_steps)
+function estimate_pair_visits(nsteps::Integer, selected_particle_count::Integer, lag_steps, start_mode::Symbol=:sliding)
+    visits_per_particle = if start_mode == :injection
+        length(lag_steps)
+    else
+        sum(nsteps - lag_step for lag_step in lag_steps)
+    end
     return Int128(selected_particle_count) * Int128(visits_per_particle)
 end
 
 function guard_exact_pair_cost!(nsteps::Integer, selected_particle_count::Integer, lag_steps, cfg)
-    estimated_visits = estimate_pair_visits(nsteps, selected_particle_count, lag_steps)
+    start_mode = dmumu_start_mode(cfg)
+    estimated_visits = estimate_pair_visits(nsteps, selected_particle_count, lag_steps, start_mode)
     limit = Int128(round(Int64, Float64(cfg[:max_pair_visits_without_allow])))
-    println("Estimated exact pair visits: ", format_count(estimated_visits))
+    println("Estimated D_mumu pair visits: ", format_count(estimated_visits))
 
     if estimated_visits > limit && !Bool(cfg[:allow_huge])
         error("""
-        Refusing to start a very large exact full-pair D_mumu calculation.
+        Refusing to start a very large D_mumu calculation.
         Estimated pair visits: $(format_count(estimated_visits))
         Safety limit without --allow-huge: $(format_count(limit))
 
@@ -472,6 +500,146 @@ function process_mu_chunk_full_pairs_cpu!(
     return nothing
 end
 
+function process_mu_chunk_injection_pairs_cpu!(
+    mu_chunk,
+    lag_steps::Vector{Int},
+    mu_edges::Vector{Float64},
+    particle_counts,
+    particle_means,
+    particle_m2s,
+    pair_sum_squares,
+    pair_counts,
+    dmumu_counts,
+    dmumu_sum_delta,
+    dmumu_sum_delta2,
+)
+    nsteps, chunk_particle_count = size(mu_chunk)
+    n_bins = length(mu_edges) - 1
+    thread_count = Threads.maxthreadid()
+
+    local_dmumu_counts = [zeros(Int64, n_bins) for _ in 1:thread_count]
+    local_dmumu_sum_delta = [zeros(Float64, n_bins) for _ in 1:thread_count]
+    local_dmumu_sum_delta2 = [zeros(Float64, n_bins) for _ in 1:thread_count]
+    local_particle_counts = zeros(Int64, thread_count)
+    local_particle_means = zeros(Float64, thread_count)
+    local_particle_m2s = zeros(Float64, thread_count)
+    local_pair_sum_squares = zeros(Float64, thread_count)
+    local_pair_counts = zeros(Int64, thread_count)
+
+    @inbounds for (lag_index, lag_step) in enumerate(lag_steps)
+        lag_step >= nsteps && continue
+
+        for thread_index in 1:thread_count
+            fill!(local_dmumu_counts[thread_index], 0)
+            fill!(local_dmumu_sum_delta[thread_index], 0.0)
+            fill!(local_dmumu_sum_delta2[thread_index], 0.0)
+        end
+        fill!(local_particle_counts, 0)
+        fill!(local_particle_means, 0.0)
+        fill!(local_particle_m2s, 0.0)
+        fill!(local_pair_sum_squares, 0.0)
+        fill!(local_pair_counts, 0)
+
+        Threads.@threads for particle_index in 1:chunk_particle_count
+            thread_index = Threads.threadid()
+            bin_counts = local_dmumu_counts[thread_index]
+            bin_sum_delta = local_dmumu_sum_delta[thread_index]
+            bin_sum_delta2 = local_dmumu_sum_delta2[thread_index]
+
+            mu_start = Float64(mu_chunk[1, particle_index])
+            mu_end = Float64(mu_chunk[1 + lag_step, particle_index])
+            if !(isfinite(mu_start) && isfinite(mu_end))
+                continue
+            end
+
+            delta_mu = mu_end - mu_start
+            delta_mu2 = delta_mu * delta_mu
+
+            bin_index = mu_bin_index_full(mu_start, mu_edges)
+            if 1 <= bin_index <= n_bins
+                bin_counts[bin_index] += 1
+                bin_sum_delta[bin_index] += delta_mu
+                bin_sum_delta2[bin_index] += delta_mu2
+            end
+
+            local_particle_counts[thread_index] += 1
+            delta = delta_mu2 - local_particle_means[thread_index]
+            local_particle_means[thread_index] += delta / local_particle_counts[thread_index]
+            delta2 = delta_mu2 - local_particle_means[thread_index]
+            local_particle_m2s[thread_index] += delta * delta2
+            local_pair_sum_squares[thread_index] += delta_mu2
+            local_pair_counts[thread_index] += 1
+        end
+
+        for thread_index in 1:thread_count
+            dmumu_counts[:, lag_index] .+= local_dmumu_counts[thread_index]
+            dmumu_sum_delta[:, lag_index] .+= local_dmumu_sum_delta[thread_index]
+            dmumu_sum_delta2[:, lag_index] .+= local_dmumu_sum_delta2[thread_index]
+
+            combine_welford_stats!(
+                particle_counts,
+                particle_means,
+                particle_m2s,
+                lag_index,
+                Int(local_particle_counts[thread_index]),
+                local_particle_means[thread_index],
+                local_particle_m2s[thread_index],
+            )
+            pair_sum_squares[lag_index] += local_pair_sum_squares[thread_index]
+            pair_counts[lag_index] += local_pair_counts[thread_index]
+        end
+    end
+
+    return nothing
+end
+
+function process_mu_chunk_dmumu_cpu!(
+    mu_chunk,
+    lag_steps::Vector{Int},
+    mu_edges::Vector{Float64},
+    particle_counts,
+    particle_means,
+    particle_m2s,
+    pair_sum_squares,
+    pair_counts,
+    dmumu_counts,
+    dmumu_sum_delta,
+    dmumu_sum_delta2,
+    start_mode::Symbol,
+)
+    if start_mode == :injection
+        return process_mu_chunk_injection_pairs_cpu!(
+            mu_chunk,
+            lag_steps,
+            mu_edges,
+            particle_counts,
+            particle_means,
+            particle_m2s,
+            pair_sum_squares,
+            pair_counts,
+            dmumu_counts,
+            dmumu_sum_delta,
+            dmumu_sum_delta2,
+        )
+    elseif start_mode == :sliding
+        return process_mu_chunk_full_pairs_cpu!(
+            mu_chunk,
+            lag_steps,
+            mu_edges,
+            particle_counts,
+            particle_means,
+            particle_m2s,
+            pair_sum_squares,
+            pair_counts,
+            dmumu_counts,
+            dmumu_sum_delta,
+            dmumu_sum_delta2,
+        )
+    end
+
+    error("Unknown dmumu_start_mode: $(start_mode)")
+end
+
 function compute_dmumu_arrays_full(counts, sum_delta, sum_delta2, tau_s, tau_norm, cfg)
     n_bins, n_lags = size(counts)
     min_count = Int(cfg[:min_count_per_cell])
@@ -587,8 +755,11 @@ function save_combined_full_h5(
         file["particle_seed"] = Int(cfg[:particle_seed])
         file["particle_block_size"] = Int(cfg[:particle_block_size])
         file["particle_indices"] = particle_indices
+        file["dmumu_start_mode"] = string(dmumu_start_mode(cfg))
         file["lag_mode"] = string(cfg[:lag_mode])
         file["n_lag_samples"] = length(lag_steps)
+        file["requested_n_lag_samples"] = Int(cfg[:n_lag_samples])
+        file["min_lag_steps"] = Int(get(cfg, :min_lag_steps, 1))
         file["lag_step_stride"] = Int(cfg[:lag_step_stride])
         file["max_lag_steps"] = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
         file["n_mu_bins"] = Int(cfg[:n_mu_bins])
@@ -596,7 +767,10 @@ function save_combined_full_h5(
         file["box_length_pc"] = Float64(cfg[:box_length_pc])
         file["field_subset"] = cfg[:field_subset] === nothing ? "nothing" : string(cfg[:field_subset])
         file["estimated_pair_visits"] = string(estimated_pair_visits)
-        file["estimator_note"] = "Full-pair exact accumulation over every selected particle and every valid start time for each selected lag; no random pair sampling. mu(t) is reconstructed once per particle chunk and reused for both delta_mu2 and D_mumu."
+        start_note = dmumu_start_mode(cfg) == :injection ?
+            "Injection-anchored accumulation: each selected particle contributes at most one pair per selected lag, Delta mu = mu(tau) - mu(0), binned by injected mu(0)." :
+            "Sliding full-pair accumulation over every selected particle and every valid start time for each selected lag; Delta mu = mu(t + tau) - mu(t), binned by pair-start mu(t)."
+        file["estimator_note"] = start_note * " No random pair sampling. mu(t) is reconstructed once per particle chunk and reused for both delta_mu2 and D_mumu."
         file["tau_average_note"] = "Lag average over the selected tau grid; this is an effective lag-averaged scattering measure, not a fitted diffusive plateau."
 
         delta_group = create_group(file, "delta_mu2")
@@ -643,7 +817,7 @@ function plot_dmumu_heatmap_full(path_png::AbstractString, mu_edges, tau_norm, d
     colorbar(label=raw"$D_{\mu\mu}/\Omega_0$ (centered)")
     xlabel(raw"$\tau\Omega_0$")
     ylabel(raw"$\mu_0$")
-    title(raw"Full-pair $D_{\mu\mu}(\mu,\tau)$")
+    title(raw"$D_{\mu\mu}(\mu,\tau)$")
     tight_layout()
     savefig(path_png, dpi=200)
     close("all")
@@ -668,7 +842,7 @@ function plot_collapsed_dmumu_full(
     plot(mu_centers, collapsed_raw_norm_count_weighted, "-.", color="tab:orange", linewidth=1.1, label="raw, count-weighted")
     xlabel(raw"$\mu_0$")
     ylabel(raw"$\langle D_{\mu\mu}/\Omega_0 \rangle_\tau$")
-    title(raw"Full-pair tau-averaged $D_{\mu\mu}(\mu)$")
+    title(raw"Tau-averaged $D_{\mu\mu}(\mu)$")
     grid(true, alpha=0.3)
     legend(frameon=false, fontsize=8)
     tight_layout()
@@ -687,6 +861,7 @@ function run_combined_full(cfg)
     backend = resolve_backend(cfg)
     T = cfg[:compute_precision]
     mu_edges, mu_centers = build_mu_edges_full(cfg)
+    start_mode = dmumu_start_mode(cfg)
 
     println("Loading magnetic field from ", cfg[:turbulence_h5])
     Bx, By, Bz = load_B_fields(cfg, T)
@@ -751,11 +926,12 @@ function run_combined_full(cfg)
         end
         println("Saved steps: ", nsteps)
         println("Lag count: ", n_lags, " from ", first(lag_steps), " to ", last(lag_steps))
+        println("D_mumu start mode: ", start_mode)
         println("Mu bins: ", n_bins)
         println("Particle chunk: ", chunk_size)
         println("Chunks: ", nchunks)
         println("Backend for mu reconstruction: ", backend)
-        println("Full-pair accumulation backend: cpu")
+        println("D_mumu accumulation backend: cpu")
         println("Julia threads: ", Threads.nthreads(), " active pool, max thread id ", Threads.maxthreadid())
 
         for chunk_id in 1:nchunks
@@ -776,7 +952,7 @@ function run_combined_full(cfg)
                 mu_chunk = reconstruct_mu_chunk_cpu(positions, momenta, Bx, By, Bz, xgrid, ygrid, zgrid, T)
             end
 
-            process_mu_chunk_full_pairs_cpu!(
+            process_mu_chunk_dmumu_cpu!(
                 mu_chunk,
                 lag_steps,
                 mu_edges,
@@ -788,6 +964,7 @@ function run_combined_full(cfg)
                 dmumu_counts,
                 dmumu_sum_delta,
                 dmumu_sum_delta2,
+                start_mode,
             )
         end
 

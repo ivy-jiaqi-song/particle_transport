@@ -179,6 +179,10 @@ Useful runtime flags:
 - `--modes=alfven,fast` or `--mode=alfven`
 - `--campaign=mp/0_5/alfven`
 - `--energy=1e5` or `--energies=1e5,1e6,1e7`
+- `--dmumu-start-mode=injection` for injection-anchored D_mumu bins using
+  `Delta mu = mu(tau) - mu(0)` and binning by injected `mu(0)`.
+- `--lag-mode=stride --min-lag-steps=MIN --lag-step-stride=STRIDE` to use
+  lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
 - `--cache-mode=mu` or `--cache-mode=phase-space`
 - `--compute-dmumu` or `--no-compute-dmumu`
 - `--keep-caches`
@@ -212,6 +216,13 @@ Each campaign folder also contains `campaign_summary.tsv`. Intermediate cache
 files live under each campaign's `cache/` folder. They are deleted after a
 successful D_mumu run when `delete_cache_on_success = true`; cache-only runs
 keep the cache because it is the final product.
+
+By default, D_mumu uses the sliding start-time estimator: for each lag it bins
+by `mu(t)` and accumulates `Delta mu = mu(t + tau) - mu(t)` over all valid start
+times. With `dmumu_start_mode = "injection"`, each particle contributes at most
+one pair per lag, binned by `mu(0)` with `Delta mu = mu(tau) - mu(0)`. The
+selected lag grid is still controlled by `lag_mode`, `min_lag_steps`,
+`max_lag_steps`, and `lag_step_stride`/`n_lag_samples`.
 
 ## Comparison Figures
 

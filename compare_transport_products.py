@@ -68,8 +68,11 @@ class Product:
     tau_norm: np.ndarray
     delta_mu2_mean: np.ndarray
     delta_mu2_sem: np.ndarray
+    mu_edges: np.ndarray
     mu_centers: np.ndarray
     dmumu_tau_average: np.ndarray
+    dmumu_start_mode: str
+    mu_bin_abs: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,6 +311,51 @@ def read_array(group: h5py.Group, dataset_name: str) -> np.ndarray:
     return np.asarray(group[dataset_name][()], dtype=float)
 
 
+def read_scalar(group: h5py.Group, dataset_name: str, default):
+    if dataset_name not in group:
+        return default
+    value = group[dataset_name][()]
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode("utf-8")
+    return value
+
+
+def read_bool(group: h5py.Group, dataset_name: str, default: bool = False) -> bool:
+    value = read_scalar(group, dataset_name, default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value) != 0
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    return default
+
+
+def normalize_dmumu_start_mode(value) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"injection", "initial", "t0", "initial_particle"}:
+        return "injection"
+    return "sliding"
+
+
+def product_mu_axis_label(product: Product) -> str:
+    if product.mu_bin_abs:
+        return r"$|\mu_0|$" if product.dmumu_start_mode == "injection" else r"$|\mu(t)|$"
+    return r"$\mu_0$" if product.dmumu_start_mode == "injection" else r"$\mu(t)$"
+
+
+def product_dmumu_title(products: list[Product]) -> str:
+    abs_modes = {product.mu_bin_abs for product in products}
+    if len(abs_modes) != 1:
+        return r"Tau-averaged $D_{\mu\mu}$"
+    return r"Tau-averaged $D_{\mu\mu}(|\mu|)$" if next(iter(abs_modes)) else r"Tau-averaged $D_{\mu\mu}(\mu)$"
+
+
 def load_product(ref: ProductRef, dmumu_variant: str) -> Product:
     dataset_name = DMUMU_VARIANTS[dmumu_variant]
     with h5py.File(ref.path, "r") as h5:
@@ -324,8 +372,11 @@ def load_product(ref: ProductRef, dmumu_variant: str) -> Product:
             tau_norm=read_array(delta_group, "tau_norm"),
             delta_mu2_mean=mean,
             delta_mu2_sem=sem,
+            mu_edges=read_array(dmumu_group, "mu_edges"),
             mu_centers=read_array(dmumu_group, "mu_centers"),
             dmumu_tau_average=read_array(dmumu_group, dataset_name),
+            dmumu_start_mode=normalize_dmumu_start_mode(read_scalar(h5, "dmumu_start_mode", "sliding")),
+            mu_bin_abs=read_bool(h5, "mu_bin_abs", False),
         )
 
 
@@ -395,9 +446,13 @@ def plot_product_group(
     axes[0].grid(True, which="both", alpha=0.28)
 
     set_scale(axes[1], "y", dmumu_y_scale)
-    axes[1].set_xlabel(r"$\mu_0$")
+    mu_axis_labels = {product_mu_axis_label(product) for product in products}
+    axes[1].set_xlabel(next(iter(mu_axis_labels)) if len(mu_axis_labels) == 1 else r"$\mu$ bin coordinate")
+    edge_min = min(float(np.nanmin(product.mu_edges)) for product in products)
+    edge_max = max(float(np.nanmax(product.mu_edges)) for product in products)
+    axes[1].set_xlim(edge_min, edge_max)
     axes[1].set_ylabel(r"$\langle D_{\mu\mu}/\Omega_0\rangle_\tau$")
-    axes[1].set_title(r"Tau-averaged $D_{\mu\mu}(\mu)$")
+    axes[1].set_title(product_dmumu_title(products))
     axes[1].grid(True, which="both", alpha=0.28)
 
     handles, legend_labels = axes[0].get_legend_handles_labels()

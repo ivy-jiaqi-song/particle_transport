@@ -26,7 +26,8 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :max_lag_steps => nothing,
     :lag_step_stride => 1,
     :n_mu_bins => 24,
-    :mu_min => -1.0,
+    :mu_bin_abs => true,
+    :mu_min => 0.0,
     :mu_max => 1.0,
     :min_count_per_cell => 20,
     :max_pair_visits_without_allow => 5.0e9,
@@ -71,6 +72,10 @@ function print_usage()
       --lag-mode=uniform|stride
       --lag-step-stride=N
       --n-mu-bins=N
+      --mu-bin-abs
+      --no-mu-bin-abs
+      --mu-min=VALUE
+      --mu-max=VALUE
       --field-subset=none|NX,NY,NZ
       --allow-huge
       --smoke
@@ -129,6 +134,13 @@ function parse_lag_mode(value::AbstractString)
     error("--lag-mode must be uniform or stride")
 end
 
+function parse_bool(value)
+    normalized_value = lowercase(strip(String(value)))
+    normalized_value in ("true", "yes", "1") && return true
+    normalized_value in ("false", "no", "0") && return false
+    error("Boolean values must be true or false.")
+end
+
 function parse_dmumu_start_mode(value)
     mode = Symbol(replace(lowercase(strip(String(value))), "-" => "_"))
     mode in (:sliding, :sliding_window, :pair_start, :current) && return :sliding
@@ -138,6 +150,10 @@ end
 
 function dmumu_start_mode(cfg)
     return parse_dmumu_start_mode(get(cfg, :dmumu_start_mode, :sliding))
+end
+
+function mu_bin_abs(cfg)
+    return Bool(get(cfg, :mu_bin_abs, true))
 end
 
 function parse_cli_config(args)
@@ -198,6 +214,12 @@ function parse_cli_config(args)
             cfg[:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-mu-bins=")
             cfg[:n_mu_bins] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif argument == "--mu-bin-abs"
+            cfg[:mu_bin_abs] = true
+        elseif argument == "--no-mu-bin-abs" || argument == "--signed-mu-bins"
+            cfg[:mu_bin_abs] = false
+        elseif startswith(argument, "--mu-bin-abs=")
+            cfg[:mu_bin_abs] = parse_bool(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--mu-min=")
             cfg[:mu_min] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--mu-max=")
@@ -242,9 +264,17 @@ function build_mu_edges_full(cfg)
     n_bins = Int(cfg[:n_mu_bins])
     mu_minimum < mu_maximum || error("mu_min must be less than mu_max.")
     n_bins > 0 || error("n_mu_bins must be positive.")
+    if mu_bin_abs(cfg)
+        mu_minimum >= 0.0 || error("mu_min must be >= 0 when mu_bin_abs is true.")
+        mu_maximum <= 1.0 || error("mu_max must be <= 1 when mu_bin_abs is true.")
+    end
     edges = collect(range(mu_minimum, mu_maximum, length=n_bins + 1))
     centers = 0.5 .* (edges[1:end-1] .+ edges[2:end])
     return edges, centers
+end
+
+@inline function mu_bin_value(mu_value::Real, bin_abs::Bool)
+    return bin_abs ? abs(mu_value) : mu_value
 end
 
 function mu_bin_index_full(mu_value::Real, mu_edges::Vector{Float64})
@@ -408,6 +438,7 @@ function process_mu_chunk_full_pairs_cpu!(
     dmumu_counts,
     dmumu_sum_delta,
     dmumu_sum_delta2,
+    bin_abs::Bool,
 )
     nsteps, chunk_particle_count = size(mu_chunk)
     n_bins = length(mu_edges) - 1
@@ -458,7 +489,7 @@ function process_mu_chunk_full_pairs_cpu!(
                 particle_sumsq += delta_mu2
                 valid_pair_count += 1
 
-                bin_index = mu_bin_index_full(mu_start, mu_edges)
+                bin_index = mu_bin_index_full(mu_bin_value(mu_start, bin_abs), mu_edges)
                 if 1 <= bin_index <= n_bins
                     bin_counts[bin_index] += 1
                     bin_sum_delta[bin_index] += delta_mu
@@ -512,6 +543,7 @@ function process_mu_chunk_injection_pairs_cpu!(
     dmumu_counts,
     dmumu_sum_delta,
     dmumu_sum_delta2,
+    bin_abs::Bool,
 )
     nsteps, chunk_particle_count = size(mu_chunk)
     n_bins = length(mu_edges) - 1
@@ -555,7 +587,7 @@ function process_mu_chunk_injection_pairs_cpu!(
             delta_mu = mu_end - mu_start
             delta_mu2 = delta_mu * delta_mu
 
-            bin_index = mu_bin_index_full(mu_start, mu_edges)
+            bin_index = mu_bin_index_full(mu_bin_value(mu_start, bin_abs), mu_edges)
             if 1 <= bin_index <= n_bins
                 bin_counts[bin_index] += 1
                 bin_sum_delta[bin_index] += delta_mu
@@ -606,6 +638,7 @@ function process_mu_chunk_dmumu_cpu!(
     dmumu_sum_delta,
     dmumu_sum_delta2,
     start_mode::Symbol,
+    bin_abs::Bool,
 )
     if start_mode == :injection
         return process_mu_chunk_injection_pairs_cpu!(
@@ -620,6 +653,7 @@ function process_mu_chunk_dmumu_cpu!(
             dmumu_counts,
             dmumu_sum_delta,
             dmumu_sum_delta2,
+            bin_abs,
         )
     elseif start_mode == :sliding
         return process_mu_chunk_full_pairs_cpu!(
@@ -634,6 +668,7 @@ function process_mu_chunk_dmumu_cpu!(
             dmumu_counts,
             dmumu_sum_delta,
             dmumu_sum_delta2,
+            bin_abs,
         )
     end
 
@@ -712,6 +747,26 @@ function average_over_tau_full(values, counts, cfg)
     return unweighted, count_weighted
 end
 
+function mu_bin_axis_label(start_mode::Symbol, bin_abs::Bool)
+    if bin_abs
+        return start_mode == :injection ? raw"$|\mu_0|$" : raw"$|\mu(t)|$"
+    end
+    return start_mode == :injection ? raw"$\mu_0$" : raw"$\mu(t)$"
+end
+
+function dmumu_plot_title(bin_abs::Bool)
+    return bin_abs ? raw"$D_{\mu\mu}(|\mu|,\tau)$" : raw"$D_{\mu\mu}(\mu,\tau)$"
+end
+
+function dmumu_tau_average_title(bin_abs::Bool)
+    return bin_abs ? raw"Tau-averaged $D_{\mu\mu}(|\mu|)$" : raw"Tau-averaged $D_{\mu\mu}(\mu)$"
+end
+
+function mu_bin_coordinate_name(start_mode::Symbol, bin_abs::Bool)
+    base = start_mode == :injection ? "mu(0)" : "mu(t)"
+    return bin_abs ? "abs(" * base * ")" : base
+end
+
 function save_combined_full_h5(
     path_h5::AbstractString,
     cfg,
@@ -755,7 +810,11 @@ function save_combined_full_h5(
         file["particle_seed"] = Int(cfg[:particle_seed])
         file["particle_block_size"] = Int(cfg[:particle_block_size])
         file["particle_indices"] = particle_indices
-        file["dmumu_start_mode"] = string(dmumu_start_mode(cfg))
+        start_mode = dmumu_start_mode(cfg)
+        bin_abs = mu_bin_abs(cfg)
+        file["dmumu_start_mode"] = string(start_mode)
+        file["mu_bin_abs"] = bin_abs
+        file["mu_bin_coordinate"] = mu_bin_coordinate_name(start_mode, bin_abs)
         file["lag_mode"] = string(cfg[:lag_mode])
         file["n_lag_samples"] = length(lag_steps)
         file["requested_n_lag_samples"] = Int(cfg[:n_lag_samples])
@@ -767,10 +826,13 @@ function save_combined_full_h5(
         file["box_length_pc"] = Float64(cfg[:box_length_pc])
         file["field_subset"] = cfg[:field_subset] === nothing ? "nothing" : string(cfg[:field_subset])
         file["estimated_pair_visits"] = string(estimated_pair_visits)
-        start_note = dmumu_start_mode(cfg) == :injection ?
+        start_note = start_mode == :injection ?
             "Injection-anchored accumulation: each selected particle contributes at most one pair per selected lag, Delta mu = mu(tau) - mu(0), binned by injected mu(0)." :
             "Sliding full-pair accumulation over every selected particle and every valid start time for each selected lag; Delta mu = mu(t + tau) - mu(t), binned by pair-start mu(t)."
-        file["estimator_note"] = start_note * " No random pair sampling. mu(t) is reconstructed once per particle chunk and reused for both delta_mu2 and D_mumu."
+        bin_note = bin_abs ?
+            " D_mumu bins use the absolute value of the start mu; stored mu values and Delta mu remain signed." :
+            " D_mumu bins use the signed start mu."
+        file["estimator_note"] = start_note * bin_note * " No random pair sampling. mu(t) is reconstructed once per particle chunk and reused for both delta_mu2 and D_mumu."
         file["tau_average_note"] = "Lag average over the selected tau grid; this is an effective lag-averaged scattering measure, not a fitted diffusive plateau."
 
         delta_group = create_group(file, "delta_mu2")
@@ -803,7 +865,15 @@ function save_combined_full_h5(
     return nothing
 end
 
-function plot_dmumu_heatmap_full(path_png::AbstractString, mu_edges, tau_norm, dmumu_centered_norm; use_usetex::Bool=false)
+function plot_dmumu_heatmap_full(
+    path_png::AbstractString,
+    mu_edges,
+    tau_norm,
+    dmumu_centered_norm;
+    use_usetex::Bool=false,
+    mu_axis_label::AbstractString=raw"$\mu_0$",
+    title_label::AbstractString=raw"$D_{\mu\mu}(\mu,\tau)$",
+)
     mkpath(dirname(path_png))
     PyPlot.rc("text", usetex=use_usetex)
     figure(figsize=(8, 4.8))
@@ -816,8 +886,8 @@ function plot_dmumu_heatmap_full(path_png::AbstractString, mu_edges, tau_norm, d
     )
     colorbar(label=raw"$D_{\mu\mu}/\Omega_0$ (centered)")
     xlabel(raw"$\tau\Omega_0$")
-    ylabel(raw"$\mu_0$")
-    title(raw"$D_{\mu\mu}(\mu,\tau)$")
+    ylabel(mu_axis_label)
+    title(title_label)
     tight_layout()
     savefig(path_png, dpi=200)
     close("all")
@@ -826,12 +896,15 @@ end
 
 function plot_collapsed_dmumu_full(
     path_png::AbstractString,
+    mu_edges,
     mu_centers,
     collapsed_raw_norm,
     collapsed_centered_norm,
     collapsed_raw_norm_count_weighted,
     collapsed_centered_norm_count_weighted;
     use_usetex::Bool=false,
+    mu_axis_label::AbstractString=raw"$\mu_0$",
+    title_label::AbstractString=raw"Tau-averaged $D_{\mu\mu}(\mu)$",
 )
     mkpath(dirname(path_png))
     PyPlot.rc("text", usetex=use_usetex)
@@ -840,9 +913,10 @@ function plot_collapsed_dmumu_full(
     plot(mu_centers, collapsed_raw_norm, "s--", color="tab:blue", linewidth=1.2, markersize=3, label="raw, tau-average")
     plot(mu_centers, collapsed_centered_norm_count_weighted, ":", color="0.35", linewidth=1.4, label="centered, count-weighted")
     plot(mu_centers, collapsed_raw_norm_count_weighted, "-.", color="tab:orange", linewidth=1.1, label="raw, count-weighted")
-    xlabel(raw"$\mu_0$")
+    xlim(mu_edges[1], mu_edges[end])
+    xlabel(mu_axis_label)
     ylabel(raw"$\langle D_{\mu\mu}/\Omega_0 \rangle_\tau$")
-    title(raw"Tau-averaged $D_{\mu\mu}(\mu)$")
+    title(title_label)
     grid(true, alpha=0.3)
     legend(frameon=false, fontsize=8)
     tight_layout()
@@ -862,6 +936,10 @@ function run_combined_full(cfg)
     T = cfg[:compute_precision]
     mu_edges, mu_centers = build_mu_edges_full(cfg)
     start_mode = dmumu_start_mode(cfg)
+    bin_abs = mu_bin_abs(cfg)
+    mu_axis_label = mu_bin_axis_label(start_mode, bin_abs)
+    heatmap_title = dmumu_plot_title(bin_abs)
+    collapsed_title = dmumu_tau_average_title(bin_abs)
 
     println("Loading magnetic field from ", cfg[:turbulence_h5])
     Bx, By, Bz = load_B_fields(cfg, T)
@@ -927,7 +1005,8 @@ function run_combined_full(cfg)
         println("Saved steps: ", nsteps)
         println("Lag count: ", n_lags, " from ", first(lag_steps), " to ", last(lag_steps))
         println("D_mumu start mode: ", start_mode)
-        println("Mu bins: ", n_bins)
+        println("Mu bin coordinate: ", mu_bin_coordinate_name(start_mode, bin_abs))
+        println("Mu bins: ", n_bins, " from ", first(mu_edges), " to ", last(mu_edges))
         println("Particle chunk: ", chunk_size)
         println("Chunks: ", nchunks)
         println("Backend for mu reconstruction: ", backend)
@@ -965,6 +1044,7 @@ function run_combined_full(cfg)
                 dmumu_sum_delta,
                 dmumu_sum_delta2,
                 start_mode,
+                bin_abs,
             )
         end
 
@@ -1015,17 +1095,28 @@ function run_combined_full(cfg)
         plot_delta_mu2(delta_df, cfg[:output_delta_png]; use_usetex=cfg[:use_usetex])
         println("Saved delta_mu2 plot to ", cfg[:output_delta_png])
 
-        plot_dmumu_heatmap_full(cfg[:output_heatmap_png], mu_edges, tau_norm, dmumu_centered_norm; use_usetex=cfg[:use_usetex])
+        plot_dmumu_heatmap_full(
+            cfg[:output_heatmap_png],
+            mu_edges,
+            tau_norm,
+            dmumu_centered_norm;
+            use_usetex=cfg[:use_usetex],
+            mu_axis_label=mu_axis_label,
+            title_label=heatmap_title,
+        )
         println("Saved D_mumu heatmap to ", cfg[:output_heatmap_png])
 
         plot_collapsed_dmumu_full(
             cfg[:output_collapsed_png],
+            mu_edges,
             mu_centers,
             collapsed_raw_norm,
             collapsed_centered_norm,
             collapsed_raw_norm_count_weighted,
             collapsed_centered_norm_count_weighted;
             use_usetex=cfg[:use_usetex],
+            mu_axis_label=mu_axis_label,
+            title_label=collapsed_title,
         )
         println("Saved D_mumu tau-average plot to ", cfg[:output_collapsed_png])
     end

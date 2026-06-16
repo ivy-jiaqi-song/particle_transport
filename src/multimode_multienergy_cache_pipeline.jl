@@ -73,7 +73,8 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :max_lag_steps => nothing,
         :lag_step_stride => 1,
         :n_mu_bins => 24,
-        :mu_min => -1.0,
+        :mu_bin_abs => true,
+        :mu_min => 0.0,
         :mu_max => 1.0,
         :min_count_per_cell => 20,
         :max_pair_visits_without_allow => 5.0e9,
@@ -512,9 +513,20 @@ function h5_scalar_int_or(file, dataset_name::AbstractString, default::Integer)
     return parse(Int, string(value))
 end
 
+function h5_scalar_bool_or(file, dataset_name::AbstractString, default::Bool)
+    value = h5_scalar_value_or(file, dataset_name, default)
+    value isa Bool && return value
+    value isa Integer && return value != 0
+    normalized = lowercase(strip(string(value)))
+    normalized in ("true", "yes", "1") && return true
+    normalized in ("false", "no", "0") && return false
+    return default
+end
+
 function combined_outputs_match_requested(path_h5::AbstractString, cfg)
     h5open(path_h5, "r") do file
         stored_start_mode = CombinedFullMod.parse_dmumu_start_mode(h5_scalar_string_or(file, "dmumu_start_mode", "sliding"))
+        stored_mu_bin_abs = h5_scalar_bool_or(file, "mu_bin_abs", false)
         stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
         stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
         stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
@@ -526,6 +538,7 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
 
         requested_max_lag_steps = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
         return stored_start_mode == CombinedFullMod.dmumu_start_mode(cfg) &&
+               stored_mu_bin_abs == CombinedFullMod.mu_bin_abs(cfg) &&
                stored_lag_mode == cfg[:lag_mode] &&
                stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
@@ -865,6 +878,10 @@ function run_combined_from_mu_cache(cfg)
 
     mu_edges, mu_centers = CombinedFullMod.build_mu_edges_full(cfg)
     start_mode = CombinedFullMod.dmumu_start_mode(cfg)
+    bin_abs = CombinedFullMod.mu_bin_abs(cfg)
+    mu_axis_label = CombinedFullMod.mu_bin_axis_label(start_mode, bin_abs)
+    heatmap_title = CombinedFullMod.dmumu_plot_title(bin_abs)
+    collapsed_title = CombinedFullMod.dmumu_tau_average_title(bin_abs)
 
     h5open(cfg[:cache_h5], "r") do cache_file
         mu_dataset = cache_file["mu"]
@@ -914,7 +931,8 @@ function run_combined_from_mu_cache(cfg)
         println("Saved steps: ", nsteps)
         println("Lag count: ", n_lags, " from ", first(lag_steps), " to ", last(lag_steps))
         println("D_mumu start mode: ", start_mode)
-        println("Mu bins: ", n_bins)
+        println("Mu bin coordinate: ", CombinedFullMod.mu_bin_coordinate_name(start_mode, bin_abs))
+        println("Mu bins: ", n_bins, " from ", first(mu_edges), " to ", last(mu_edges))
         println("Particle chunk: ", chunk_size)
         println("Chunks: ", nchunks)
         println("D_mumu accumulation backend: cpu")
@@ -942,6 +960,7 @@ function run_combined_from_mu_cache(cfg)
                 dmumu_sum_delta,
                 dmumu_sum_delta2,
                 start_mode,
+                bin_abs,
             )
         end
 
@@ -994,17 +1013,28 @@ function run_combined_from_mu_cache(cfg)
         CombinedFullMod.plot_delta_mu2(delta_df, cfg[:output_delta_png]; use_usetex=cfg[:use_usetex])
         println("Saved delta_mu2 plot to ", cfg[:output_delta_png])
 
-        CombinedFullMod.plot_dmumu_heatmap_full(cfg[:output_heatmap_png], mu_edges, tau_norm, dmumu_centered_norm; use_usetex=cfg[:use_usetex])
+        CombinedFullMod.plot_dmumu_heatmap_full(
+            cfg[:output_heatmap_png],
+            mu_edges,
+            tau_norm,
+            dmumu_centered_norm;
+            use_usetex=cfg[:use_usetex],
+            mu_axis_label=mu_axis_label,
+            title_label=heatmap_title,
+        )
         println("Saved D_mumu heatmap to ", cfg[:output_heatmap_png])
 
         CombinedFullMod.plot_collapsed_dmumu_full(
             cfg[:output_collapsed_png],
+            mu_edges,
             mu_centers,
             collapsed_raw_norm,
             collapsed_centered_norm,
             collapsed_raw_norm_count_weighted,
             collapsed_centered_norm_count_weighted;
             use_usetex=cfg[:use_usetex],
+            mu_axis_label=mu_axis_label,
+            title_label=collapsed_title,
         )
         println("Saved D_mumu tau-average plot to ", cfg[:output_collapsed_png])
     end
@@ -1334,6 +1364,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:boundary, :compute_backend, :particle_selection) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
+    key == :mu_bin_abs && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
     return value
@@ -1652,6 +1683,18 @@ function runtime_config()
             cfg[:combined_overrides][:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--max-lag-steps=")
             cfg[:combined_overrides][:max_lag_steps] = config_maybe_int(split(argument, "=", limit=2)[2], "--max-lag-steps")
+        elseif startswith(argument, "--n-mu-bins=")
+            cfg[:combined_overrides][:n_mu_bins] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif argument == "--mu-bin-abs"
+            cfg[:combined_overrides][:mu_bin_abs] = true
+        elseif argument == "--no-mu-bin-abs" || argument == "--signed-mu-bins"
+            cfg[:combined_overrides][:mu_bin_abs] = false
+        elseif startswith(argument, "--mu-bin-abs=")
+            cfg[:combined_overrides][:mu_bin_abs] = config_bool(split(argument, "=", limit=2)[2], "--mu-bin-abs")
+        elseif startswith(argument, "--mu-min=")
+            cfg[:combined_overrides][:mu_min] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--mu-max=")
+            cfg[:combined_overrides][:mu_max] = parse(Float64, split(argument, "=", limit=2)[2])
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)

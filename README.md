@@ -94,6 +94,8 @@ The current public config layout is:
     `particles = "all"` uses all cached particles. Lag settings still apply in
     both cases.
   - Lag sampling, mu binning, backend, chunk size, and safety-limit controls.
+  - `mu_bin_abs = true` bins D_mumu by `abs(mu_start)` over `mu_min = 0.0` to
+    `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
 
 Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
 but new configs should use the generic `[input]` form.
@@ -181,6 +183,9 @@ Useful runtime flags:
 - `--energy=1e5` or `--energies=1e5,1e6,1e7`
 - `--dmumu-start-mode=injection` for injection-anchored D_mumu bins using
   `Delta mu = mu(tau) - mu(0)` and binning by injected `mu(0)`.
+- `--mu-bin-abs` or `[dmumu].mu_bin_abs = true` to bin by `abs(mu_start)`.
+  With `dmumu_start_mode=injection`, this gives `|mu_0|` bins from 0 to 1.
+- `--n-mu-bins=N --mu-min=0 --mu-max=1` to control the D_mumu bin axis.
 - `--lag-mode=stride --min-lag-steps=MIN --lag-step-stride=STRIDE` to use
   lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
 - `--cache-mode=mu` or `--cache-mode=phase-space`
@@ -223,6 +228,10 @@ times. With `dmumu_start_mode = "injection"`, each particle contributes at most
 one pair per lag, binned by `mu(0)` with `Delta mu = mu(tau) - mu(0)`. The
 selected lag grid is still controlled by `lag_mode`, `min_lag_steps`,
 `max_lag_steps`, and `lag_step_stride`/`n_lag_samples`.
+
+When `mu_bin_abs = true`, only the bin coordinate changes: sliding mode bins by
+`|mu(t)|`, injection mode bins by `|mu(0)|`, and the generated D_mumu plots use
+a 0 to 1 `|mu|` axis.
 
 ## Comparison Figures
 

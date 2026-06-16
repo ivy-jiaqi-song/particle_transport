@@ -93,6 +93,7 @@ gpu_threads = 256
 # D_mumu estimator mode.
 # "sliding": bin by mu(t), use Delta mu = mu(t + tau) - mu(t) over all valid start times.
 # "injection": bin by injected mu(0), use Delta mu = mu(tau) - mu(0) once per particle per lag.
+# With mu_bin_abs = true below, these become |mu(t)| and |mu(0)| bins.
 dmumu_start_mode = "sliding"
 
 # Particle controls for sampled D_mumu runs.
@@ -112,9 +113,11 @@ n_lag_samples = 40
 max_lag_steps = "none"
 lag_step_stride = 1
 
-# D_mumu mu-binning and safety controls.
+# D_mumu mu-binning and safety controls. mu_bin_abs bins by abs(mu_start)
+# while stored mu values and Delta mu remain signed.
 n_mu_bins = 24
-mu_min = -1.0
+mu_bin_abs = true
+mu_min = 0.0
 mu_max = 1.0
 min_count_per_cell = 20
 max_pair_visits_without_allow = 5.0e9

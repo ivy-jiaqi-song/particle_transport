@@ -470,33 +470,37 @@ function verify_cache_h5(path_h5::AbstractString, cache_mode::Symbol)
     error("Unknown cache mode: " * string(cache_mode))
 end
 
-function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString, dpp_png=nothing, energy_hist_png=nothing; compute_dpp::Bool=false)
+function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString, dpp_png=nothing, energy_hist_png=nothing; compute_dmumu::Bool=true, compute_dpp::Bool=false)
     verify_file_nonempty(path_h5)
-    verify_file_nonempty(delta_png)
-    verify_file_nonempty(heatmap_png)
-    verify_file_nonempty(collapsed_png)
+    compute_dmumu && verify_file_nonempty(delta_png)
+    compute_dmumu && verify_file_nonempty(heatmap_png)
+    compute_dmumu && verify_file_nonempty(collapsed_png)
     compute_dpp && verify_file_nonempty(dpp_png)
     compute_dpp && verify_file_nonempty(energy_hist_png)
 
     h5open(path_h5, "r") do file
-        delta_group = file["delta_mu2"]
-        dmumu_group = file["dmumu"]
+        if compute_dmumu
+            delta_group = file["delta_mu2"]
+            dmumu_group = file["dmumu"]
 
-        delta_tau_norm = read(delta_group["tau_norm"])
-        mean_curve = read(delta_group["delta_mu2_particle_mean"])
-        length(delta_tau_norm) == length(mean_curve) || error("Combined verification failed: delta_mu2 tau/curve mismatch for " * path_h5)
-        length(delta_tau_norm) > 0 || error("Combined verification failed: no delta_mu2 lag points in " * path_h5)
-        any(isfinite, mean_curve) || error("Combined verification failed: no finite delta_mu2 values in " * path_h5)
+            delta_tau_norm = read(delta_group["tau_norm"])
+            mean_curve = read(delta_group["delta_mu2_particle_mean"])
+            length(delta_tau_norm) == length(mean_curve) || error("Combined verification failed: delta_mu2 tau/curve mismatch for " * path_h5)
+            length(delta_tau_norm) > 0 || error("Combined verification failed: no delta_mu2 lag points in " * path_h5)
+            any(isfinite, mean_curve) || error("Combined verification failed: no finite delta_mu2 values in " * path_h5)
 
-        mu_centers = read(dmumu_group["mu_centers"])
-        dmumu_tau_norm = read(dmumu_group["tau_norm"])
-        heatmap = read(dmumu_group["D_mumu_centered_norm"])
-        collapsed = read(dmumu_group["D_mumu_centered_tau_average_norm"])
-        size(heatmap, 1) == length(mu_centers) || error("Combined verification failed: dmumu mu axis mismatch for " * path_h5)
-        size(heatmap, 2) == length(dmumu_tau_norm) || error("Combined verification failed: dmumu tau axis mismatch for " * path_h5)
-        length(collapsed) == length(mu_centers) || error("Combined verification failed: dmumu collapsed curve mismatch for " * path_h5)
-        any(isfinite, heatmap) || error("Combined verification failed: no finite dmumu heatmap values in " * path_h5)
-        any(isfinite, collapsed) || error("Combined verification failed: no finite dmumu collapsed values in " * path_h5)
+            mu_centers = read(dmumu_group["mu_centers"])
+            dmumu_tau_norm = read(dmumu_group["tau_norm"])
+            heatmap = read(dmumu_group["D_mumu_centered_norm"])
+            collapsed = read(dmumu_group["D_mumu_centered_tau_average_norm"])
+            size(heatmap, 1) == length(mu_centers) || error("Combined verification failed: dmumu mu axis mismatch for " * path_h5)
+            size(heatmap, 2) == length(dmumu_tau_norm) || error("Combined verification failed: dmumu tau axis mismatch for " * path_h5)
+            length(collapsed) == length(mu_centers) || error("Combined verification failed: dmumu collapsed curve mismatch for " * path_h5)
+            any(isfinite, heatmap) || error("Combined verification failed: no finite dmumu heatmap values in " * path_h5)
+            any(isfinite, collapsed) || error("Combined verification failed: no finite dmumu collapsed values in " * path_h5)
+        elseif haskey(file, "delta_mu2") || haskey(file, "dmumu")
+            error("Combined verification failed: D_mumu outputs exist but compute_dmumu is false for " * path_h5)
+        end
 
         if compute_dpp
             dpp_group = file["dpp"]
@@ -547,10 +551,17 @@ end
 
 function combined_outputs_match_requested(path_h5::AbstractString, cfg)
     h5open(path_h5, "r") do file
+        requested_compute_dmumu = Bool(get(cfg, :compute_dmumu, true))
         requested_compute_dpp = Bool(get(cfg, :compute_dpp, false))
         if requested_compute_dpp && !(haskey(file, "dpp") && haskey(file, "energy_snapshots"))
             return false
         end
+        if requested_compute_dmumu && !(haskey(file, "delta_mu2") && haskey(file, "dmumu"))
+            return false
+        elseif !requested_compute_dmumu && (haskey(file, "delta_mu2") || haskey(file, "dmumu"))
+            return false
+        end
+        requested_compute_dmumu || return true
         stored_start_mode = CombinedFullMod.parse_dmumu_start_mode(h5_scalar_string_or(file, "dmumu_start_mode", "sliding"))
         stored_mu_bin_abs = h5_scalar_bool_or(file, "mu_bin_abs", false)
         stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
@@ -579,8 +590,9 @@ end
 
 function compact_outputs_complete(paths, cfg)
     try
+        compute_dmumu = Bool(get(cfg, :compute_dmumu, true))
         compute_dpp = Bool(get(cfg, :compute_dpp, false))
-        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dpp=compute_dpp)
+        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dmumu=compute_dmumu, compute_dpp=compute_dpp)
         combined_outputs_match_requested(paths.combined_h5, cfg) || return false
         return true
     catch
@@ -1161,18 +1173,24 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             :output_collapsed_png => paths.dmumu_collapsed_png,
             :output_dpp_png => paths.dpp_png,
             :output_energy_hist_png => paths.energy_hist_png,
+            :compute_dmumu => cfg[:compute_dmumu],
             :compute_dpp => cfg[:compute_dpp],
         ),
     )
 
     if cfg[:cache_mode] == :phase_space
+        if !cfg[:compute_dmumu]
+            rm(paths.delta_png; force=true)
+            rm(paths.dmumu_heatmap_png; force=true)
+            rm(paths.dmumu_collapsed_png; force=true)
+        end
         CombinedFullMod.run_combined_full(analysis_cfg)
         append_cache_metadata!(paths.combined_h5, :phase_space, paths.cache_h5)
     else
         run_combined_from_mu_cache(analysis_cfg)
     end
 
-    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dpp=cfg[:compute_dpp])
+    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dmumu=cfg[:compute_dmumu], compute_dpp=cfg[:compute_dpp])
     deleted = delete_cache_if_requested(paths.cache_h5, cfg)
     return summary_row(
         energy_GeV,

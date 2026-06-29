@@ -27,7 +27,8 @@ root = "outputs/campaigns_cache"
 # is smaller when the only downstream product is D_mumu.
 cache_mode = "mu"
 
-# Set false to stop after trajectory/cache generation.
+# Set false to skip D_mumu and delta_mu2 outputs. If compute_dpp is also false,
+# the run stops after trajectory/cache generation.
 compute_dmumu = true
 
 # Compute global D_pp and energy-distribution snapshots. This requires the

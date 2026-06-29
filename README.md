@@ -75,7 +75,8 @@ The current public config layout is:
 - `[run]`
   - `cache_mode`: `phase-space` records positions and momenta; `mu` writes a
     compact pitch-angle cache for D_mumu-focused runs.
-  - `compute_dmumu`: set `false` to stop after trajectory/cache generation.
+  - `compute_dmumu`: set `false` to skip `D_mumu` and `delta_mu2` products;
+    if `compute_dpp` is also `false`, the run stops after cache generation.
   - `compute_dpp`: set `true` to compute global momentum diffusion and energy
     snapshot histograms; this automatically uses `phase-space` cache output.
   - `mode_decomposition_available`: `true` means files such as

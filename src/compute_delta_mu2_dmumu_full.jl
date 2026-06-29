@@ -908,7 +908,7 @@ function save_combined_full_h5(
     cfg,
     backend::Symbol,
     estimated_pair_visits,
-    delta_df::DataFrame,
+    delta_df,
     mu_edges,
     mu_centers,
     lag_steps,
@@ -936,6 +936,7 @@ function save_combined_full_h5(
 )
     mkpath(dirname(path_h5))
     h5open(path_h5, "w") do file
+        compute_dmumu = delta_df !== nothing && dmumu_counts !== nothing
         file["trajectory_h5"] = string(cfg[:trajectory_h5])
         file["turbulence_h5"] = string(cfg[:turbulence_h5])
         file["compute_backend"] = string(backend)
@@ -948,57 +949,60 @@ function save_combined_full_h5(
         file["particle_seed"] = Int(cfg[:particle_seed])
         file["particle_block_size"] = Int(cfg[:particle_block_size])
         file["particle_indices"] = particle_indices
-        start_mode = dmumu_start_mode(cfg)
-        bin_abs = mu_bin_abs(cfg)
-        file["dmumu_start_mode"] = string(start_mode)
-        file["mu_bin_abs"] = bin_abs
-        file["mu_bin_coordinate"] = mu_bin_coordinate_name(start_mode, bin_abs)
         file["lag_mode"] = string(cfg[:lag_mode])
         file["n_lag_samples"] = length(lag_steps)
         file["requested_n_lag_samples"] = Int(cfg[:n_lag_samples])
         file["min_lag_steps"] = Int(get(cfg, :min_lag_steps, 1))
         file["lag_step_stride"] = Int(cfg[:lag_step_stride])
         file["max_lag_steps"] = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
-        file["n_mu_bins"] = Int(cfg[:n_mu_bins])
         file["min_count_per_cell"] = Int(cfg[:min_count_per_cell])
         file["box_length_pc"] = Float64(cfg[:box_length_pc])
         file["field_subset"] = cfg[:field_subset] === nothing ? "nothing" : string(cfg[:field_subset])
         file["estimated_pair_visits"] = string(estimated_pair_visits)
-        start_note = start_mode == :injection ?
-            "Injection-anchored accumulation: each selected particle contributes at most one pair per selected lag, Delta mu = mu(tau) - mu(0), binned by injected mu(0)." :
-            "Sliding full-pair accumulation over every selected particle and every valid start time for each selected lag; Delta mu = mu(t + tau) - mu(t), binned by pair-start mu(t)."
-        bin_note = bin_abs ?
-            " D_mumu bins use the absolute value of the start mu; stored mu values and Delta mu remain signed." :
-            " D_mumu bins use the signed start mu."
-        file["estimator_note"] = start_note * bin_note * " No random pair sampling. mu(t) is reconstructed once per particle chunk and reused for both delta_mu2 and D_mumu."
         file["tau_average_note"] = "Lag average over the selected tau grid; this is an effective lag-averaged scattering measure, not a fitted diffusive plateau."
         file["dpp_note"] = "Global scalar momentum diffusion uses p = sqrt(px^2 + py^2 + pz^2) and Delta p = p(t + tau) - p(t), accumulated over the same selected particles and sliding start times as D_mumu. Normalized D_pp uses Delta p / p0 and tau * Omega0."
 
-        delta_group = create_group(file, "delta_mu2")
-        for column_name in names(delta_df)
-            delta_group[string(column_name)] = collect(delta_df[!, column_name])
-        end
+        if compute_dmumu
+            start_mode = dmumu_start_mode(cfg)
+            bin_abs = mu_bin_abs(cfg)
+            file["dmumu_start_mode"] = string(start_mode)
+            file["mu_bin_abs"] = bin_abs
+            file["mu_bin_coordinate"] = mu_bin_coordinate_name(start_mode, bin_abs)
+            file["n_mu_bins"] = Int(cfg[:n_mu_bins])
+            start_note = start_mode == :injection ?
+                "Injection-anchored accumulation: each selected particle contributes at most one pair per selected lag, Delta mu = mu(tau) - mu(0), binned by injected mu(0)." :
+                "Sliding full-pair accumulation over every selected particle and every valid start time for each selected lag; Delta mu = mu(t + tau) - mu(t), binned by pair-start mu(t)."
+            bin_note = bin_abs ?
+                " D_mumu bins use the absolute value of the start mu; stored mu values and Delta mu remain signed." :
+                " D_mumu bins use the signed start mu."
+            file["estimator_note"] = start_note * bin_note * " No random pair sampling. mu(t) is reconstructed once per particle chunk and reused for both delta_mu2 and D_mumu."
 
-        dmumu_group = create_group(file, "dmumu")
-        dmumu_group["mu_edges"] = mu_edges
-        dmumu_group["mu_centers"] = mu_centers
-        dmumu_group["lag_step"] = lag_steps
-        dmumu_group["tau_s"] = tau_s
-        dmumu_group["tau_norm"] = tau_norm
-        dmumu_group["count_pairs_full"] = dmumu_counts
-        dmumu_group["sum_delta_mu"] = dmumu_sum_delta
-        dmumu_group["sum_delta_mu2"] = dmumu_sum_delta2
-        dmumu_group["mean_delta_mu"] = mean_delta
-        dmumu_group["mean_delta_mu2"] = mean_delta2
-        dmumu_group["A_mu_norm"] = drift_norm
-        dmumu_group["D_mumu_raw_norm"] = dmumu_raw_norm
-        dmumu_group["D_mumu_centered_norm"] = dmumu_centered_norm
-        dmumu_group["D_mumu_raw_per_s"] = dmumu_raw_per_s
-        dmumu_group["D_mumu_centered_per_s"] = dmumu_centered_per_s
-        dmumu_group["D_mumu_raw_tau_average_norm"] = collapsed_raw_norm
-        dmumu_group["D_mumu_centered_tau_average_norm"] = collapsed_centered_norm
-        dmumu_group["D_mumu_raw_tau_average_norm_count_weighted"] = collapsed_raw_norm_count_weighted
-        dmumu_group["D_mumu_centered_tau_average_norm_count_weighted"] = collapsed_centered_norm_count_weighted
+            delta_group = create_group(file, "delta_mu2")
+            for column_name in names(delta_df)
+                delta_group[string(column_name)] = collect(delta_df[!, column_name])
+            end
+
+            dmumu_group = create_group(file, "dmumu")
+            dmumu_group["mu_edges"] = mu_edges
+            dmumu_group["mu_centers"] = mu_centers
+            dmumu_group["lag_step"] = lag_steps
+            dmumu_group["tau_s"] = tau_s
+            dmumu_group["tau_norm"] = tau_norm
+            dmumu_group["count_pairs_full"] = dmumu_counts
+            dmumu_group["sum_delta_mu"] = dmumu_sum_delta
+            dmumu_group["sum_delta_mu2"] = dmumu_sum_delta2
+            dmumu_group["mean_delta_mu"] = mean_delta
+            dmumu_group["mean_delta_mu2"] = mean_delta2
+            dmumu_group["A_mu_norm"] = drift_norm
+            dmumu_group["D_mumu_raw_norm"] = dmumu_raw_norm
+            dmumu_group["D_mumu_centered_norm"] = dmumu_centered_norm
+            dmumu_group["D_mumu_raw_per_s"] = dmumu_raw_per_s
+            dmumu_group["D_mumu_centered_per_s"] = dmumu_centered_per_s
+            dmumu_group["D_mumu_raw_tau_average_norm"] = collapsed_raw_norm
+            dmumu_group["D_mumu_centered_tau_average_norm"] = collapsed_centered_norm
+            dmumu_group["D_mumu_raw_tau_average_norm_count_weighted"] = collapsed_raw_norm_count_weighted
+            dmumu_group["D_mumu_centered_tau_average_norm_count_weighted"] = collapsed_centered_norm_count_weighted
+        end
 
         if dpp_results !== nothing
             dpp_group = create_group(file, "dpp")
@@ -1135,30 +1139,52 @@ end
 function run_combined_full(cfg)
     mkpath(cfg[:output_dir])
     mkpath(dirname(cfg[:output_h5]))
-    mkpath(dirname(cfg[:output_delta_png]))
-    mkpath(dirname(cfg[:output_heatmap_png]))
-    mkpath(dirname(cfg[:output_collapsed_png]))
-    Bool(get(cfg, :compute_dpp, false)) && mkpath(dirname(cfg[:output_dpp_png]))
-    Bool(get(cfg, :compute_dpp, false)) && mkpath(dirname(cfg[:output_energy_hist_png]))
+    compute_dmumu = Bool(get(cfg, :compute_dmumu, true))
+    compute_dpp = Bool(get(cfg, :compute_dpp, false))
+    compute_dmumu && mkpath(dirname(cfg[:output_delta_png]))
+    compute_dmumu && mkpath(dirname(cfg[:output_heatmap_png]))
+    compute_dmumu && mkpath(dirname(cfg[:output_collapsed_png]))
+    if !compute_dmumu
+        rm(cfg[:output_delta_png]; force=true)
+        rm(cfg[:output_heatmap_png]; force=true)
+        rm(cfg[:output_collapsed_png]; force=true)
+    end
+    compute_dpp && mkpath(dirname(cfg[:output_dpp_png]))
+    compute_dpp && mkpath(dirname(cfg[:output_energy_hist_png]))
+    compute_dmumu || compute_dpp || error("At least one of compute_dmumu or compute_dpp must be true for combined analysis.")
 
-    backend = resolve_backend(cfg)
+    backend = compute_dmumu ? resolve_backend(cfg) : :not_used
     T = cfg[:compute_precision]
-    mu_edges, mu_centers = build_mu_edges_full(cfg)
+    mu_edges = Float64[]
+    mu_centers = Float64[]
     start_mode = dmumu_start_mode(cfg)
     bin_abs = mu_bin_abs(cfg)
-    mu_axis_label = mu_bin_axis_label(start_mode, bin_abs)
-    heatmap_title = dmumu_plot_title(bin_abs)
-    collapsed_title = dmumu_tau_average_title(bin_abs)
+    mu_axis_label = ""
+    heatmap_title = ""
+    collapsed_title = ""
+    Bx = nothing
+    By = nothing
+    Bz = nothing
+    xgrid = nothing
+    ygrid = nothing
+    zgrid = nothing
 
-    println("Loading magnetic field from ", cfg[:turbulence_h5])
-    Bx, By, Bz = load_B_fields(cfg, T)
-    nx, ny, nz = size(Bx)
-    xgrid, ygrid, zgrid = build_uniform_coords(cfg, nx, ny, nz, T)
+    if compute_dmumu
+        mu_edges, mu_centers = build_mu_edges_full(cfg)
+        mu_axis_label = mu_bin_axis_label(start_mode, bin_abs)
+        heatmap_title = dmumu_plot_title(bin_abs)
+        collapsed_title = dmumu_tau_average_title(bin_abs)
+
+        println("Loading magnetic field from ", cfg[:turbulence_h5])
+        Bx, By, Bz = load_B_fields(cfg, T)
+        nx, ny, nz = size(Bx)
+        xgrid, ygrid, zgrid = build_uniform_coords(cfg, nx, ny, nz, T)
+    end
 
     dBx = nothing
     dBy = nothing
     dBz = nothing
-    if backend == :gpu
+    if compute_dmumu && backend == :gpu
         println("Moving magnetic field to GPU")
         dBx = CuArray(Bx)
         dBy = CuArray(By)
@@ -1186,15 +1212,14 @@ function run_combined_full(cfg)
 
         n_lags = length(lag_steps)
         n_bins = length(mu_centers)
-        particle_counts = zeros(Int, n_lags)
-        particle_means = zeros(Float64, n_lags)
-        particle_m2s = zeros(Float64, n_lags)
-        pair_sum_squares = zeros(Float64, n_lags)
-        pair_counts = zeros(Int64, n_lags)
-        dmumu_counts = zeros(Int64, n_bins, n_lags)
-        dmumu_sum_delta = zeros(Float64, n_bins, n_lags)
-        dmumu_sum_delta2 = zeros(Float64, n_bins, n_lags)
-        compute_dpp = Bool(get(cfg, :compute_dpp, false))
+        particle_counts = compute_dmumu ? zeros(Int, n_lags) : nothing
+        particle_means = compute_dmumu ? zeros(Float64, n_lags) : nothing
+        particle_m2s = compute_dmumu ? zeros(Float64, n_lags) : nothing
+        pair_sum_squares = compute_dmumu ? zeros(Float64, n_lags) : nothing
+        pair_counts = compute_dmumu ? zeros(Int64, n_lags) : nothing
+        dmumu_counts = compute_dmumu ? zeros(Int64, n_bins, n_lags) : nothing
+        dmumu_sum_delta = compute_dmumu ? zeros(Float64, n_bins, n_lags) : nothing
+        dmumu_sum_delta2 = compute_dmumu ? zeros(Float64, n_bins, n_lags) : nothing
         p0 = compute_dpp ? momentum_magnitude(momenta_dataset[particle_indices[1], 1, 1], momenta_dataset[particle_indices[1], 2, 1], momenta_dataset[particle_indices[1], 3, 1]) : NaN
         compute_dpp && !(isfinite(p0) && p0 > 0.0) && error("Cannot compute D_pp normalization: first selected particle has invalid initial momentum.")
         dpp_counts = zeros(Int64, n_lags)
@@ -1223,13 +1248,17 @@ function run_combined_full(cfg)
         end
         println("Saved steps: ", nsteps)
         println("Lag count: ", n_lags, " from ", first(lag_steps), " to ", last(lag_steps))
-        println("D_mumu start mode: ", start_mode)
-        println("Mu bin coordinate: ", mu_bin_coordinate_name(start_mode, bin_abs))
-        println("Mu bins: ", n_bins, " from ", first(mu_edges), " to ", last(mu_edges))
+        if compute_dmumu
+            println("D_mumu start mode: ", start_mode)
+            println("Mu bin coordinate: ", mu_bin_coordinate_name(start_mode, bin_abs))
+            println("Mu bins: ", n_bins, " from ", first(mu_edges), " to ", last(mu_edges))
+        else
+            println("D_mumu products: disabled")
+        end
         println("Particle chunk: ", chunk_size)
         println("Chunks: ", nchunks)
-        println("Backend for mu reconstruction: ", backend)
-        println("D_mumu accumulation backend: cpu")
+        compute_dmumu && println("Backend for mu reconstruction: ", backend)
+        compute_dmumu && println("D_mumu accumulation backend: cpu")
         compute_dpp && println("D_pp and energy snapshots: enabled with ", length(snapshot_indices), " snapshots")
         println("Julia threads: ", Threads.nthreads(), " active pool, max thread id ", Threads.maxthreadid())
 
@@ -1239,33 +1268,35 @@ function run_combined_full(cfg)
             chunk_indices = particle_indices[selection_first:selection_last]
             println("Chunk ", chunk_id, "/", nchunks, ": ", length(chunk_indices), " selected particles, index span ", first(chunk_indices), "-", last(chunk_indices))
 
-            positions = read_particle_batch(positions_dataset, chunk_indices)
             momenta = read_particle_batch(momenta_dataset, chunk_indices)
 
-            if backend == :gpu
-                dmu_chunk = reconstruct_mu_chunk_gpu(positions, momenta, dBx, dBy, dBz, xgrid, ygrid, zgrid, cfg, T)
-                mu_chunk = Array(dmu_chunk)
-                GC.gc(false)
-                CUDA.reclaim()
-            else
-                mu_chunk = reconstruct_mu_chunk_cpu(positions, momenta, Bx, By, Bz, xgrid, ygrid, zgrid, T)
-            end
+            if compute_dmumu
+                positions = read_particle_batch(positions_dataset, chunk_indices)
+                if backend == :gpu
+                    dmu_chunk = reconstruct_mu_chunk_gpu(positions, momenta, dBx, dBy, dBz, xgrid, ygrid, zgrid, cfg, T)
+                    mu_chunk = Array(dmu_chunk)
+                    GC.gc(false)
+                    CUDA.reclaim()
+                else
+                    mu_chunk = reconstruct_mu_chunk_cpu(positions, momenta, Bx, By, Bz, xgrid, ygrid, zgrid, T)
+                end
 
-            process_mu_chunk_dmumu_cpu!(
-                mu_chunk,
-                lag_steps,
-                mu_edges,
-                particle_counts,
-                particle_means,
-                particle_m2s,
-                pair_sum_squares,
-                pair_counts,
-                dmumu_counts,
-                dmumu_sum_delta,
-                dmumu_sum_delta2,
-                start_mode,
-                bin_abs,
-            )
+                process_mu_chunk_dmumu_cpu!(
+                    mu_chunk,
+                    lag_steps,
+                    mu_edges,
+                    particle_counts,
+                    particle_means,
+                    particle_m2s,
+                    pair_sum_squares,
+                    pair_counts,
+                    dmumu_counts,
+                    dmumu_sum_delta,
+                    dmumu_sum_delta2,
+                    start_mode,
+                    bin_abs,
+                )
+            end
 
             if compute_dpp
                 process_momenta_chunk_dpp_cpu!(
@@ -1282,18 +1313,32 @@ function run_combined_full(cfg)
             end
         end
 
-        delta_df = build_output_dataframe(lag_steps, t_s, t_norm, particle_counts, particle_means, particle_m2s, pair_sum_squares, pair_counts)
+        delta_df = nothing
+        mean_delta = nothing
+        mean_delta2 = nothing
+        drift_norm = nothing
+        dmumu_raw_norm = nothing
+        dmumu_centered_norm = nothing
+        dmumu_raw_per_s = nothing
+        dmumu_centered_per_s = nothing
+        collapsed_raw_norm = nothing
+        collapsed_centered_norm = nothing
+        collapsed_raw_norm_count_weighted = nothing
+        collapsed_centered_norm_count_weighted = nothing
+        if compute_dmumu
+            delta_df = build_output_dataframe(lag_steps, t_s, t_norm, particle_counts, particle_means, particle_m2s, pair_sum_squares, pair_counts)
 
-        mean_delta,
-        mean_delta2,
-        drift_norm,
-        dmumu_raw_norm,
-        dmumu_centered_norm,
-        dmumu_raw_per_s,
-        dmumu_centered_per_s = compute_dmumu_arrays_full(dmumu_counts, dmumu_sum_delta, dmumu_sum_delta2, tau_s, tau_norm, cfg)
+            mean_delta,
+            mean_delta2,
+            drift_norm,
+            dmumu_raw_norm,
+            dmumu_centered_norm,
+            dmumu_raw_per_s,
+            dmumu_centered_per_s = compute_dmumu_arrays_full(dmumu_counts, dmumu_sum_delta, dmumu_sum_delta2, tau_s, tau_norm, cfg)
 
-        collapsed_raw_norm, collapsed_raw_norm_count_weighted = average_over_tau_full(dmumu_raw_norm, dmumu_counts, cfg)
-        collapsed_centered_norm, collapsed_centered_norm_count_weighted = average_over_tau_full(dmumu_centered_norm, dmumu_counts, cfg)
+            collapsed_raw_norm, collapsed_raw_norm_count_weighted = average_over_tau_full(dmumu_raw_norm, dmumu_counts, cfg)
+            collapsed_centered_norm, collapsed_centered_norm_count_weighted = average_over_tau_full(dmumu_centered_norm, dmumu_counts, cfg)
+        end
         dpp_results = nothing
         energy_snapshot_results = nothing
         if compute_dpp
@@ -1370,33 +1415,35 @@ function run_combined_full(cfg)
         )
         println("Saved combined HDF5 to ", cfg[:output_h5])
 
-        plot_delta_mu2(delta_df, cfg[:output_delta_png]; use_usetex=cfg[:use_usetex])
-        println("Saved delta_mu2 plot to ", cfg[:output_delta_png])
+        if compute_dmumu
+            plot_delta_mu2(delta_df, cfg[:output_delta_png]; use_usetex=cfg[:use_usetex])
+            println("Saved delta_mu2 plot to ", cfg[:output_delta_png])
 
-        plot_dmumu_heatmap_full(
-            cfg[:output_heatmap_png],
-            mu_edges,
-            tau_norm,
-            dmumu_centered_norm;
-            use_usetex=cfg[:use_usetex],
-            mu_axis_label=mu_axis_label,
-            title_label=heatmap_title,
-        )
-        println("Saved D_mumu heatmap to ", cfg[:output_heatmap_png])
+            plot_dmumu_heatmap_full(
+                cfg[:output_heatmap_png],
+                mu_edges,
+                tau_norm,
+                dmumu_centered_norm;
+                use_usetex=cfg[:use_usetex],
+                mu_axis_label=mu_axis_label,
+                title_label=heatmap_title,
+            )
+            println("Saved D_mumu heatmap to ", cfg[:output_heatmap_png])
 
-        plot_collapsed_dmumu_full(
-            cfg[:output_collapsed_png],
-            mu_edges,
-            mu_centers,
-            collapsed_raw_norm,
-            collapsed_centered_norm,
-            collapsed_raw_norm_count_weighted,
-            collapsed_centered_norm_count_weighted;
-            use_usetex=cfg[:use_usetex],
-            mu_axis_label=mu_axis_label,
-            title_label=collapsed_title,
-        )
-        println("Saved D_mumu tau-average plot to ", cfg[:output_collapsed_png])
+            plot_collapsed_dmumu_full(
+                cfg[:output_collapsed_png],
+                mu_edges,
+                mu_centers,
+                collapsed_raw_norm,
+                collapsed_centered_norm,
+                collapsed_raw_norm_count_weighted,
+                collapsed_centered_norm_count_weighted;
+                use_usetex=cfg[:use_usetex],
+                mu_axis_label=mu_axis_label,
+                title_label=collapsed_title,
+            )
+            println("Saved D_mumu tau-average plot to ", cfg[:output_collapsed_png])
+        end
 
         if compute_dpp
             plot_dpp_tau_full(cfg[:output_dpp_png], tau_norm, dpp_results.dpp_raw_norm, dpp_results.dpp_centered_norm; use_usetex=cfg[:use_usetex])

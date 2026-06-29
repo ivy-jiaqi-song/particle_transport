@@ -1083,16 +1083,18 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
 
     println()
     println("=== Energy ", energy_GeV, " GeV ===")
-    if !cfg[:compute_dmumu] && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
+    compute_analysis = cfg[:compute_dmumu] || cfg[:compute_dpp]
+
+    if !compute_analysis && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
-        println("Cache already verified; D_mumu disabled for energy ", energy_GeV, " GeV")
+        println("Cache already verified; transport analysis disabled for energy ", energy_GeV, " GeV")
         return summary_row(
             energy_GeV,
             "skipped_existing_cache",
             false,
             paths.cache_h5,
             "",
-            "verified existing cache; D_mumu disabled",
+            "verified existing cache; transport analysis disabled",
         )
     end
 
@@ -1132,16 +1134,16 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         end
     end
 
-    if !cfg[:compute_dmumu]
+    if !compute_analysis
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
-        println("D_mumu disabled; keeping verified cache file ", paths.cache_h5)
+        println("Transport analysis disabled; keeping verified cache file ", paths.cache_h5)
         return summary_row(
             energy_GeV,
             "cache_only",
             false,
             paths.cache_h5,
             "",
-            "verified cache; D_mumu disabled",
+            "verified cache; transport analysis disabled",
         )
     end
 

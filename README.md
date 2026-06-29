@@ -76,6 +76,8 @@ The current public config layout is:
   - `cache_mode`: `phase-space` records positions and momenta; `mu` writes a
     compact pitch-angle cache for D_mumu-focused runs.
   - `compute_dmumu`: set `false` to stop after trajectory/cache generation.
+  - `compute_dpp`: set `true` to compute global momentum diffusion and energy
+    snapshot histograms; this automatically uses `phase-space` cache output.
   - `mode_decomposition_available`: `true` means files such as
     `<stem>_alfven.h5`, `<stem>_fast.h5`, and `<stem>_slow.h5` exist. `false`
     means only the total input file is used.
@@ -96,6 +98,10 @@ The current public config layout is:
   - Lag sampling, mu binning, backend, chunk size, and safety-limit controls.
   - `mu_bin_abs = true` bins D_mumu by `abs(mu_start)` over `mu_min = 0.0` to
     `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
+
+- `[dpp]`
+  - Optional controls for global `D_pp` runs: `n_energy_snapshots` and
+    `energy_hist_bins`.
 
 Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
 but new configs should use the generic `[input]` form.
@@ -216,6 +222,8 @@ Each energy folder contains:
 - `delta_mu2_curve_full.png`
 - `dmumu_mu_tau_full.png`
 - `dmumu_tau_average_full.png`
+- `dpp_tau_average_full.png` when `compute_dpp = true`
+- `energy_distribution_snapshots.png` when `compute_dpp = true`
 
 Each campaign folder also contains `campaign_summary.tsv`. Intermediate cache
 files live under each campaign's `cache/` folder. They are deleted after a
@@ -232,6 +240,13 @@ selected lag grid is still controlled by `lag_mode`, `min_lag_steps`,
 When `mu_bin_abs = true`, only the bin coordinate changes: sliding mode bins by
 `|mu(t)|`, injection mode bins by `|mu(0)|`, and the generated D_mumu plots use
 a 0 to 1 `|mu|` axis.
+
+When `compute_dpp = true`, the phase-space postprocessor also computes global
+scalar momentum diffusion with `p = sqrt(px^2 + py^2 + pz^2)`,
+`Delta p = p(t + tau) - p(t)`, and normalized output
+`D_pp/(p0^2 Omega0) = Var(Delta p / p0) / (2 tau Omega0)`. It also saves
+evenly spaced kinetic-energy snapshots in the HDF5 `energy_snapshots` group and
+plots them together in `energy_distribution_snapshots.png`.
 
 ## Comparison Figures
 

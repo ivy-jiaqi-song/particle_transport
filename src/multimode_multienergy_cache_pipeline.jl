@@ -27,6 +27,7 @@ const MHD512_MODE_DIR = raw"/home/user0001/MHDFlows_replicate/mhdflows512_mode_d
 const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
     :cache_mode => :mu,
     :compute_dmumu => true,
+    :compute_dpp => false,
     :mode_campaigns => nothing,
     :energies => [1e5, 1e6, 1e7],
     :delete_cache_on_success => true,
@@ -79,6 +80,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :min_count_per_cell => 20,
         :max_pair_visits_without_allow => 5.0e9,
         :allow_huge => true,
+        :compute_dpp => false,
+        :n_energy_snapshots => 5,
+        :energy_hist_bins => 60,
         :use_usetex => false,
     ),
 )
@@ -421,6 +425,10 @@ function verify_file_nonempty(path::AbstractString)
     return true
 end
 
+function verify_file_nonempty(path)
+    error("Missing file path for verification: " * string(path))
+end
+
 function verify_phase_space_cache_h5(path_h5::AbstractString)
     verify_file_nonempty(path_h5)
     h5open(path_h5, "r") do file
@@ -462,11 +470,13 @@ function verify_cache_h5(path_h5::AbstractString, cache_mode::Symbol)
     error("Unknown cache mode: " * string(cache_mode))
 end
 
-function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString)
+function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString, dpp_png=nothing, energy_hist_png=nothing; compute_dpp::Bool=false)
     verify_file_nonempty(path_h5)
     verify_file_nonempty(delta_png)
     verify_file_nonempty(heatmap_png)
     verify_file_nonempty(collapsed_png)
+    compute_dpp && verify_file_nonempty(dpp_png)
+    compute_dpp && verify_file_nonempty(energy_hist_png)
 
     h5open(path_h5, "r") do file
         delta_group = file["delta_mu2"]
@@ -487,6 +497,18 @@ function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractStr
         length(collapsed) == length(mu_centers) || error("Combined verification failed: dmumu collapsed curve mismatch for " * path_h5)
         any(isfinite, heatmap) || error("Combined verification failed: no finite dmumu heatmap values in " * path_h5)
         any(isfinite, collapsed) || error("Combined verification failed: no finite dmumu collapsed values in " * path_h5)
+
+        if compute_dpp
+            dpp_group = file["dpp"]
+            energy_group = file["energy_snapshots"]
+            dpp_tau_norm = read(dpp_group["tau_norm"])
+            dpp_centered = read(dpp_group["D_pp_centered_norm"])
+            energies = read(energy_group["energy_GeV"])
+            length(dpp_tau_norm) == length(dpp_centered) || error("Combined verification failed: dpp tau/curve mismatch for " * path_h5)
+            any(isfinite, dpp_centered) || error("Combined verification failed: no finite D_pp values in " * path_h5)
+            size(energies, 1) > 0 || error("Combined verification failed: no energy snapshots in " * path_h5)
+            any(isfinite, energies) || error("Combined verification failed: no finite snapshot energies in " * path_h5)
+        end
     end
 
     return true
@@ -525,6 +547,10 @@ end
 
 function combined_outputs_match_requested(path_h5::AbstractString, cfg)
     h5open(path_h5, "r") do file
+        requested_compute_dpp = Bool(get(cfg, :compute_dpp, false))
+        if requested_compute_dpp && !(haskey(file, "dpp") && haskey(file, "energy_snapshots"))
+            return false
+        end
         stored_start_mode = CombinedFullMod.parse_dmumu_start_mode(h5_scalar_string_or(file, "dmumu_start_mode", "sliding"))
         stored_mu_bin_abs = h5_scalar_bool_or(file, "mu_bin_abs", false)
         stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
@@ -553,7 +579,8 @@ end
 
 function compact_outputs_complete(paths, cfg)
     try
-        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png)
+        compute_dpp = Bool(get(cfg, :compute_dpp, false))
+        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dpp=compute_dpp)
         combined_outputs_match_requested(paths.combined_h5, cfg) || return false
         return true
     catch
@@ -614,6 +641,8 @@ function build_energy_paths(cfg, energy_GeV)
     delta_png = joinpath(science_dir, "delta_mu2_curve_full.png")
     dmumu_heatmap_png = joinpath(science_dir, "dmumu_mu_tau_full.png")
     dmumu_collapsed_png = joinpath(science_dir, "dmumu_tau_average_full.png")
+    dpp_png = joinpath(science_dir, "dpp_tau_average_full.png")
+    energy_hist_png = joinpath(science_dir, "energy_distribution_snapshots.png")
     return (
         cache_dir = cache_dir,
         science_dir = science_dir,
@@ -622,6 +651,8 @@ function build_energy_paths(cfg, energy_GeV)
         delta_png = delta_png,
         dmumu_heatmap_png = dmumu_heatmap_png,
         dmumu_collapsed_png = dmumu_collapsed_png,
+        dpp_png = dpp_png,
+        energy_hist_png = energy_hist_png,
     )
 end
 
@@ -1006,6 +1037,8 @@ function run_combined_from_mu_cache(cfg)
             collapsed_centered_norm,
             collapsed_raw_norm_count_weighted,
             collapsed_centered_norm_count_weighted,
+            nothing,
+            nothing,
         )
         append_cache_metadata!(cfg[:output_h5], :mu, cfg[:cache_h5])
         println("Saved combined HDF5 to ", cfg[:output_h5])
@@ -1124,6 +1157,9 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             :output_delta_png => paths.delta_png,
             :output_heatmap_png => paths.dmumu_heatmap_png,
             :output_collapsed_png => paths.dmumu_collapsed_png,
+            :output_dpp_png => paths.dpp_png,
+            :output_energy_hist_png => paths.energy_hist_png,
+            :compute_dpp => cfg[:compute_dpp],
         ),
     )
 
@@ -1134,7 +1170,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         run_combined_from_mu_cache(analysis_cfg)
     end
 
-    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png)
+    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dpp=cfg[:compute_dpp])
     deleted = delete_cache_if_requested(paths.cache_h5, cfg)
     return summary_row(
         energy_GeV,
@@ -1203,6 +1239,7 @@ function materialize_campaign_cfg(cfg, campaign_spec)
         :turbulence_h5 => campaign_spec[:turbulence_h5],
         :cache_mode => cfg[:cache_mode],
         :compute_dmumu => cfg[:compute_dmumu],
+        :compute_dpp => cfg[:compute_dpp],
         :energies => get(campaign_spec, :energies, cfg[:energies]),
         :delete_cache_on_success => cfg[:delete_cache_on_success],
         :reuse_existing_cache => cfg[:reuse_existing_cache],
@@ -1463,7 +1500,7 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     isfile(absolute_config_path) || error("Config file not found: " * absolute_config_path)
     config = TOML.parsefile(absolute_config_path)
 
-    validate_toml_keys(config, Set(["input", "output", "run", "particles", "dmumu", "trajectory", "combined"]), "config")
+    validate_toml_keys(config, Set(["input", "output", "run", "particles", "dmumu", "dpp", "trajectory", "combined"]), "config")
 
     input = toml_section(config, "input")
     apply_input_section!(cfg, input)
@@ -1478,6 +1515,7 @@ function apply_toml_config!(cfg, config_path::AbstractString)
         Set([
             "cache_mode",
             "compute_dmumu",
+            "compute_dpp",
             "mode_decomposition_available",
             "available_modes",
             "energies_gev",
@@ -1498,6 +1536,7 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     )
     haskey(run, "cache_mode") && (cfg[:cache_mode] = parse_cache_mode(run["cache_mode"]))
     haskey(run, "compute_dmumu") && (cfg[:compute_dmumu] = config_bool(run["compute_dmumu"], "[run].compute_dmumu"))
+    haskey(run, "compute_dpp") && (cfg[:compute_dpp] = config_bool(run["compute_dpp"], "[run].compute_dpp"))
     haskey(run, "mode_decomposition_available") && (cfg[:mode_decomposition_available] = config_bool(run["mode_decomposition_available"], "[run].mode_decomposition_available"))
     haskey(run, "available_modes") && (cfg[:available_modes] = config_available_modes(run["available_modes"], "[run].available_modes"))
     haskey(run, "energies_gev") && (cfg[:energies] = config_energy_values(run["energies_gev"], "[run].energies_gev"))
@@ -1518,6 +1557,7 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     apply_override_section!(cfg[:trajectory_overrides], toml_section(config, "particles"), "[particles]")
     apply_override_section!(cfg[:combined_overrides], toml_section(config, "combined"), "[combined]")
     apply_dmumu_section!(cfg, toml_section(config, "dmumu"))
+    apply_override_section!(cfg[:combined_overrides], toml_section(config, "dpp"), "[dpp]")
     return absolute_config_path
 end
 
@@ -1596,6 +1636,10 @@ function runtime_config()
             cfg[:compute_dmumu] = true
         elseif argument == "--no-compute-dmumu"
             cfg[:compute_dmumu] = false
+        elseif argument == "--compute-dpp"
+            cfg[:compute_dpp] = true
+        elseif argument == "--no-compute-dpp"
+            cfg[:compute_dpp] = false
         elseif startswith(argument, "--mode-decomposition-root=")
             cfg[:input_kind] = :legacy
             cfg[:input_paths][:mode_decomposition_root] = resolve_cli_path(split(argument, "=", limit=2)[2])
@@ -1606,6 +1650,12 @@ function runtime_config()
             cfg[:input_kind] = :legacy
             cfg[:input_paths][:mhd512_mode_dir] = resolve_cli_path(split(argument, "=", limit=2)[2])
         end
+    end
+    if cfg[:compute_dpp]
+        cache_mode = :phase_space
+        cfg[:combined_overrides][:compute_dpp] = true
+    else
+        cfg[:combined_overrides][:compute_dpp] = false
     end
     cfg[:cache_mode] = cache_mode
     cfg[:input_layout] = input_layout
@@ -1695,6 +1745,10 @@ function runtime_config()
             cfg[:combined_overrides][:mu_min] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--mu-max=")
             cfg[:combined_overrides][:mu_max] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--n-energy-snapshots=")
+            cfg[:combined_overrides][:n_energy_snapshots] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--energy-hist-bins=")
+            cfg[:combined_overrides][:energy_hist_bins] = parse(Int, split(argument, "=", limit=2)[2])
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)
@@ -1714,7 +1768,6 @@ function runtime_config()
     if cfg[:dmumu_particles] == :all
         apply_all_particles_dmumu!(cfg)
     end
-
     validate_selected_values(all_campaigns, selected_turbulences, :turbulence_tag, "--turbulence")
     validate_selected_values(all_campaigns, selected_modes, :mode_name, "--mode")
     validate_selected_values(all_campaigns, selected_campaigns, :campaign_tag, "--campaign")

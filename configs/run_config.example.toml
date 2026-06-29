@@ -134,3 +134,4 @@ use_usetex = false
 # particles and lag grid as D_mumu, and writes five energy snapshots by default.
 n_energy_snapshots = 5
 energy_hist_bins = 60
+energy_hist_y_scale = "log"  # "log" helps reveal small tails; use "linear" for raw counts.

@@ -83,6 +83,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :compute_dpp => false,
         :n_energy_snapshots => 5,
         :energy_hist_bins => 60,
+        :energy_hist_y_scale => :log,
         :use_usetex => false,
     ),
 )
@@ -1420,6 +1421,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
     key in (:boundary, :compute_backend, :particle_selection) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
+    key == :energy_hist_y_scale && return CombinedFullMod.parse_energy_hist_y_scale(value)
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
     key == :mu_bin_abs && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
@@ -1769,6 +1771,8 @@ function runtime_config()
             cfg[:combined_overrides][:n_energy_snapshots] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--energy-hist-bins=")
             cfg[:combined_overrides][:energy_hist_bins] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--energy-hist-y-scale=")
+            cfg[:combined_overrides][:energy_hist_y_scale] = CombinedFullMod.parse_energy_hist_y_scale(split(argument, "=", limit=2)[2])
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)

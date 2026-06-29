@@ -48,6 +48,8 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :n_energy_snapshots => 5,
     :energy_hist_bins => 60,
     :energy_hist_y_scale => :log,
+    :energy_hist_x_min => nothing,
+    :energy_hist_x_max => nothing,
     :use_usetex => false,
 )
 
@@ -1062,25 +1064,42 @@ function plot_dpp_tau_full(path_png::AbstractString, tau_norm, dpp_raw_norm, dpp
     return nothing
 end
 
-function plot_energy_histograms(path_png::AbstractString, snapshot_t_norm, energy_gev; bins::Integer=60, y_scale::Symbol=:log, use_usetex::Bool=false)
+function energy_histogram_range(values, x_min, x_max)
+    finite_values = Float64[value for value in values if isfinite(value) && value >= 0.0]
+    isempty(finite_values) && error("Cannot plot energy histogram: no finite nonnegative energies.")
+
+    data_min = minimum(finite_values)
+    data_max = maximum(finite_values)
+    lower = x_min === nothing ? data_min : Float64(x_min)
+    upper = x_max === nothing ? data_max : Float64(x_max)
+    lower = max(0.0, lower)
+    upper > lower || error("energy histogram x max must be greater than x min.")
+
+    if x_min === nothing || x_max === nothing
+        span = data_max - data_min
+        padding = span > 0.0 ? 0.05 * span : max(abs(data_max) * 0.01, 1.0e-12)
+        x_min === nothing && (lower = max(0.0, data_min - padding))
+        x_max === nothing && (upper = data_max + padding)
+    end
+
+    upper > lower || (upper = lower + max(abs(lower) * 0.01, 1.0e-12))
+    return lower, upper
+end
+
+function plot_energy_histograms(path_png::AbstractString, snapshot_t_norm, energy_gev; bins::Integer=60, y_scale::Symbol=:log, x_min=nothing, x_max=nothing, use_usetex::Bool=false)
     mkpath(dirname(path_png))
     PyPlot.rc("text", usetex=use_usetex)
     figure(figsize=(7.5, 4.5))
     snapshot_count = size(energy_gev, 1)
     all_values = Float64[value for value in vec(energy_gev) if isfinite(value) && value >= 0.0]
-    if isempty(all_values)
-        close("all")
-        error("Cannot plot energy histogram: no finite nonnegative energies.")
-    end
-    max_energy = maximum(all_values)
-    upper_edge = max_energy > 0.0 ? max_energy * 1.000001 : 1.0
-    bin_edges = collect(range(0.0, upper_edge, length=max(2, Int(bins) + 1)))
+    lower_edge, upper_edge = energy_histogram_range(all_values, x_min, x_max)
+    bin_edges = collect(range(lower_edge, upper_edge, length=max(2, Int(bins) + 1)))
     for snapshot_index in 1:snapshot_count
         values = Float64[value for value in energy_gev[snapshot_index, :] if isfinite(value) && value >= 0.0]
         isempty(values) && continue
         hist(values, bins=bin_edges, histtype="step", linewidth=1.4, density=false, label=@sprintf("tOmega0 = %.3g", snapshot_t_norm[snapshot_index]))
     end
-    xlim(0.0, upper_edge)
+    xlim(lower_edge, upper_edge)
     if y_scale == :log
         yscale("log")
     elseif y_scale != :linear
@@ -1475,6 +1494,8 @@ function run_combined_full(cfg)
                 energy_snapshot_results.energy_gev;
                 bins=Int(get(cfg, :energy_hist_bins, 60)),
                 y_scale=parse_energy_hist_y_scale(get(cfg, :energy_hist_y_scale, :log)),
+                x_min=get(cfg, :energy_hist_x_min, nothing),
+                x_max=get(cfg, :energy_hist_x_max, nothing),
                 use_usetex=cfg[:use_usetex],
             )
             println("Saved energy histogram plot to ", cfg[:output_energy_hist_png])

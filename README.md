@@ -103,8 +103,10 @@ The current public config layout is:
 - `[dpp]`
   - Optional controls for global `D_pp` runs: `n_energy_snapshots` and
     `energy_hist_bins`.
-  - Energy histograms use shared bins from 0 to the maximum snapshot energy and
-    plot particle counts per bin; `energy_hist_y_scale = "log"` is the default.
+  - Energy histograms use shared bins over the finite energy range across all
+    snapshots and plot particle counts per bin; `energy_hist_y_scale = "log"`
+    is the default. Use `energy_hist_x_min` and `energy_hist_x_max` to force a
+    specific energy window.
 
 Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
 but new configs should use the generic `[input]` form.

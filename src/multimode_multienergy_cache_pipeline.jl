@@ -84,6 +84,8 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :n_energy_snapshots => 5,
         :energy_hist_bins => 60,
         :energy_hist_y_scale => :log,
+        :energy_hist_x_min => nothing,
+        :energy_hist_x_max => nothing,
         :use_usetex => false,
     ),
 )
@@ -1426,6 +1428,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key == :mu_bin_abs && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
+    key in (:energy_hist_x_min, :energy_hist_x_max) && return value === nothing ? nothing : config_float(value, key_name)
     return value
 end
 
@@ -1773,6 +1776,10 @@ function runtime_config()
             cfg[:combined_overrides][:energy_hist_bins] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--energy-hist-y-scale=")
             cfg[:combined_overrides][:energy_hist_y_scale] = CombinedFullMod.parse_energy_hist_y_scale(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--energy-hist-x-min=")
+            cfg[:combined_overrides][:energy_hist_x_min] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--energy-hist-x-max=")
+            cfg[:combined_overrides][:energy_hist_x_max] = parse(Float64, split(argument, "=", limit=2)[2])
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)

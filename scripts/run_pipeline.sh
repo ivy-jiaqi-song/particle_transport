@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'status=$?; echo "Pipeline launcher failed at line $LINENO with exit code $status" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -44,5 +45,7 @@ if [[ "$USER_HAS_CONFIG" -eq 0 ]]; then
 fi
 
 echo "Run mode: $RUN_LABEL"
+echo "Julia executable: $JULIA_BIN"
+echo "Repository: $REPO_DIR"
 cd "$REPO_DIR"
 exec "$JULIA_BIN" "$REPO_DIR/run_pipeline.jl" "${CONFIG_ARG[@]}" "${EXTRA_ARGS[@]}" "$@"

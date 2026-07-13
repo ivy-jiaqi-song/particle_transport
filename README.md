@@ -88,6 +88,14 @@ The current public config layout is:
 - `[particles]`
   - Physical trajectory settings: field dataset names, velocity unit, box size,
     eta, integration time, boundary behavior.
+  - Injection controls: `injection_position_mode = "random"` keeps the existing
+    random-in-box start positions; `"fixed"` uses `injection_position`. With
+    `injection_position_unit = "box-fraction"`, `[0.5, 0.5, 0.5]` is the box
+    center. Units `"pc"` and `"m"` are also accepted.
+  - Momentum injection defaults to `injection_mode = "isotropic"`. Set
+    `injection_mode = "fixed-mu"` and `injection_mu0 = VALUE` to inject every
+    particle with the requested pitch-angle cosine relative to the local
+    magnetic field while keeping gyrophase random.
   - Particle and cache burden settings: particle count, precision, field subset,
     saved time stride, output precision.
 

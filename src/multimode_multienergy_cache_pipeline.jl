@@ -50,6 +50,11 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :precision => Float64,
         :field_subset => nothing,
         :boundary => :periodic,
+        :injection_mode => :isotropic,
+        :injection_mu0 => 0.0,
+        :injection_position_mode => :random,
+        :injection_position => (0.5, 0.5, 0.5),
+        :injection_position_unit => :box_fraction,
         :trajectory_time_stride => 1,
         :trajectory_output_precision => Float32,
         :progress_every => 5000,
@@ -473,6 +478,45 @@ function verify_cache_h5(path_h5::AbstractString, cache_mode::Symbol)
     error("Unknown cache mode: " * string(cache_mode))
 end
 
+function requested_default_injection(cfg)
+    return RunnerMod.injection_mode(cfg) == :isotropic && RunnerMod.injection_position_mode(cfg) == :random
+end
+
+function read_h5_string(file, key::AbstractString)
+    value = read(file[key])
+    value isa AbstractArray && (value = first(value))
+    return String(value)
+end
+
+function verify_cache_injection_metadata(path_h5::AbstractString, cfg)
+    requested_default_injection(cfg) && return true
+    h5open(path_h5, "r") do file
+        required = ("injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
+        missing = [key for key in required if !haskey(file, key)]
+        isempty(missing) || error("Existing HDF5 lacks injection metadata required for non-default injection: " * join(missing, ", ") * ". Regenerate the cache/output for this injection configuration.")
+
+        stored_mode = Symbol(read_h5_string(file, "injection_mode"))
+        stored_pos_mode = Symbol(read_h5_string(file, "injection_position_mode"))
+        stored_pos_unit = Symbol(read_h5_string(file, "injection_position_unit"))
+        stored_mu0 = Float64(first(read(file["injection_mu0"])))
+        stored_position = Float64.(read(file["injection_position"]))
+
+        requested_mode = RunnerMod.injection_mode(cfg)
+        requested_pos_mode = RunnerMod.injection_position_mode(cfg)
+        requested_pos_unit = RunnerMod.injection_position_unit(cfg)
+        requested_mu0 = Float64(get(cfg, :injection_mu0, 0.0))
+        requested_position = Float64[Float64(v) for v in RunnerMod.injection_position_tuple(cfg, Float64)]
+
+        stored_mode == requested_mode || error("Existing cache injection_mode=" * string(stored_mode) * " does not match requested " * string(requested_mode))
+        stored_pos_mode == requested_pos_mode || error("Existing cache injection_position_mode=" * string(stored_pos_mode) * " does not match requested " * string(requested_pos_mode))
+        stored_pos_unit == requested_pos_unit || error("Existing cache injection_position_unit=" * string(stored_pos_unit) * " does not match requested " * string(requested_pos_unit))
+        isapprox(stored_mu0, requested_mu0; atol=1.0e-12, rtol=0.0) || error("Existing cache injection_mu0=" * string(stored_mu0) * " does not match requested " * string(requested_mu0))
+        length(stored_position) == 3 || error("Existing cache injection_position metadata is malformed")
+        all(isapprox.(stored_position, requested_position; atol=1.0e-12, rtol=0.0)) || error("Existing cache injection_position does not match requested injection_position")
+    end
+    return true
+end
+
 function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString, dpp_png=nothing, energy_hist_png=nothing; compute_dmumu::Bool=true, compute_dpp::Bool=false)
     verify_file_nonempty(path_h5)
     compute_dmumu && verify_file_nonempty(delta_png)
@@ -701,6 +745,7 @@ function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_sav
     file["cache_mode"] = "mu"
     file["cache_output_precision"] = string(writer.outtype)
     file["mu_unit"] = "dimensionless"
+    RunnerMod.write_injection_metadata!(file, cfg)
     close(file)
     return nothing
 end
@@ -764,7 +809,7 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     save_indices = RunnerMod.sampled_step_indices(nsteps, trajectory_stride)
     nsave = length(save_indices)
 
-    x1, x2, x3, p1, p2, p3 = RunnerMod.init_particles(cfg, x, y, z, gamma0, v0, T)
+    x1, x2, x3, p1, p2, p3 = RunnerMod.init_particles(cfg, x, y, z, gamma0, v0, T, Bx, By, Bz)
     dx1 = CuArray(x1)
     dx2 = CuArray(x2)
     dx3 = CuArray(x3)
@@ -911,6 +956,11 @@ function append_cache_metadata!(path_h5::AbstractString, cache_mode::Symbol, cac
         file["cache_mode"] = string(cache_mode)
         file["cache_h5"] = string(cache_h5)
         file["cache_dataset"] = cache_mode == :mu ? "mu" : "positions,momenta"
+        h5open(cache_h5, "r") do cache_file
+            for key in ("injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
+                haskey(cache_file, key) && (file[key] = read(cache_file[key]))
+            end
+        end
     end
     return nothing
 end
@@ -1102,6 +1152,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
 
     if !compute_analysis && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
+        verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
         println("Cache already verified; transport analysis disabled for energy ", energy_GeV, " GeV")
         return summary_row(
             energy_GeV,
@@ -1114,9 +1165,11 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     end
 
     if cfg[:skip_completed_outputs] && compact_outputs_complete(paths, requested_analysis_cfg)
+        verify_cache_injection_metadata(paths.combined_h5, base_runner_cfg)
         deleted = false
         if isfile(paths.cache_h5)
             verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
+            verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
             deleted = delete_cache_if_requested(paths.cache_h5, cfg)
         end
         println("Combined outputs already verified; skipping energy ", energy_GeV, " GeV")
@@ -1133,6 +1186,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     if cfg[:reuse_existing_cache] && isfile(paths.cache_h5)
         println("Reusing existing cache file ", paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
+        verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
     else
         if cfg[:cache_mode] == :phase_space
             runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(
@@ -1151,6 +1205,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
 
     if !compute_analysis
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
+        verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
         println("Transport analysis disabled; keeping verified cache file ", paths.cache_h5)
         return summary_row(
             energy_GeV,
@@ -1388,6 +1443,20 @@ function config_tuple3_strings(value, key_name::AbstractString)
     return Tuple(values)
 end
 
+function config_tuple3_floats(value, key_name::AbstractString)
+    values = if value isa AbstractString
+        selected = split_csv_selector(value; flag_name=key_name)
+        selected === nothing && error(key_name * " must contain three numeric values.")
+        [parse(Float64, item) for item in selected]
+    elseif value isa AbstractVector || value isa Tuple
+        [config_float(item, key_name) for item in value]
+    else
+        error(key_name * " must be a string or array of three numeric values.")
+    end
+    length(values) == 3 || error(key_name * " must contain exactly three numeric values.")
+    return Tuple(values)
+end
+
 function config_field_subset(value, key_name::AbstractString)
     if value isa AbstractString
         normalized = lowercase(strip(value))
@@ -1419,9 +1488,10 @@ end
 
 function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
+    key == :injection_position && return config_tuple3_floats(value, key_name)
     key == :field_subset && return config_field_subset(value, key_name)
     key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
-    key in (:boundary, :compute_backend, :particle_selection) && return config_symbol(value, key_name)
+    key in (:boundary, :compute_backend, :particle_selection, :injection_mode, :injection_position_mode, :injection_position_unit) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
     key == :energy_hist_y_scale && return CombinedFullMod.parse_energy_hist_y_scale(value)
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)

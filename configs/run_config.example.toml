@@ -73,6 +73,15 @@ use_cfl = false
 cfl = 0.2
 boundary = "periodic"
 
+# Injection controls. Defaults preserve the historical behavior: random position
+# and isotropic momentum direction. For fixed mu0, mu is defined relative to the
+# local magnetic field at each injection position and gyrophase remains random.
+injection_position_mode = "random"  # "random" or "fixed".
+injection_position = [0.5, 0.5, 0.5]
+injection_position_unit = "box-fraction"  # "box-fraction", "pc", or "m".
+injection_mode = "isotropic"  # "isotropic" or "fixed-mu".
+injection_mu0 = 0.0
+
 # Ensemble and trajectory-cache burden settings.
 seed = 42
 n_particles = 100000

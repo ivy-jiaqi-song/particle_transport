@@ -140,10 +140,7 @@ use_usetex = false
 
 [dpp]
 # Global D_pp uses scalar p = sqrt(px^2 + py^2 + pz^2) over the same selected
-# particles and lag grid as D_mumu, and writes five energy snapshots by default.
+# particles and lag grid as D_mumu. The pipeline writes energy snapshots into
+# each delta_mu2_dmumu_full.h5 file, then builds campaign-level energy
+# distribution figures with scripts/plot_energy_distribution.py.
 n_energy_snapshots = 5
-energy_hist_bins = 60
-energy_hist_y_scale = "log"  # "log" helps reveal small tails; use "linear" for raw counts.
-# Leave unset to zoom to the finite energy range across all snapshots.
-# energy_hist_x_min = 99900.0
-# energy_hist_x_max = 100100.0

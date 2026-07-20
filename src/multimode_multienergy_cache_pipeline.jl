@@ -87,10 +87,6 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :allow_huge => true,
         :compute_dpp => false,
         :n_energy_snapshots => 5,
-        :energy_hist_bins => 60,
-        :energy_hist_y_scale => :log,
-        :energy_hist_x_min => nothing,
-        :energy_hist_x_max => nothing,
         :use_usetex => false,
     ),
 )
@@ -517,13 +513,12 @@ function verify_cache_injection_metadata(path_h5::AbstractString, cfg)
     return true
 end
 
-function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString, dpp_png=nothing, energy_hist_png=nothing; compute_dmumu::Bool=true, compute_dpp::Bool=false)
+function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractString, heatmap_png::AbstractString, collapsed_png::AbstractString, dpp_png=nothing; compute_dmumu::Bool=true, compute_dpp::Bool=false)
     verify_file_nonempty(path_h5)
     compute_dmumu && verify_file_nonempty(delta_png)
     compute_dmumu && verify_file_nonempty(heatmap_png)
     compute_dmumu && verify_file_nonempty(collapsed_png)
     compute_dpp && verify_file_nonempty(dpp_png)
-    compute_dpp && verify_file_nonempty(energy_hist_png)
 
     h5open(path_h5, "r") do file
         if compute_dmumu
@@ -639,7 +634,7 @@ function compact_outputs_complete(paths, cfg)
     try
         compute_dmumu = Bool(get(cfg, :compute_dmumu, true))
         compute_dpp = Bool(get(cfg, :compute_dpp, false))
-        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dmumu=compute_dmumu, compute_dpp=compute_dpp)
+        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png; compute_dmumu=compute_dmumu, compute_dpp=compute_dpp)
         combined_outputs_match_requested(paths.combined_h5, cfg) || return false
         return true
     catch
@@ -701,7 +696,6 @@ function build_energy_paths(cfg, energy_GeV)
     dmumu_heatmap_png = joinpath(science_dir, "dmumu_mu_tau_full.png")
     dmumu_collapsed_png = joinpath(science_dir, "dmumu_tau_average_full.png")
     dpp_png = joinpath(science_dir, "dpp_tau_average_full.png")
-    energy_hist_png = joinpath(science_dir, "energy_distribution_snapshots.png")
     return (
         cache_dir = cache_dir,
         science_dir = science_dir,
@@ -711,7 +705,6 @@ function build_energy_paths(cfg, energy_GeV)
         dmumu_heatmap_png = dmumu_heatmap_png,
         dmumu_collapsed_png = dmumu_collapsed_png,
         dpp_png = dpp_png,
-        energy_hist_png = energy_hist_png,
     )
 end
 
@@ -1230,7 +1223,6 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             :output_heatmap_png => paths.dmumu_heatmap_png,
             :output_collapsed_png => paths.dmumu_collapsed_png,
             :output_dpp_png => paths.dpp_png,
-            :output_energy_hist_png => paths.energy_hist_png,
             :compute_dmumu => cfg[:compute_dmumu],
             :compute_dpp => cfg[:compute_dpp],
         ),
@@ -1248,7 +1240,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         run_combined_from_mu_cache(analysis_cfg)
     end
 
-    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png, paths.energy_hist_png; compute_dmumu=cfg[:compute_dmumu], compute_dpp=cfg[:compute_dpp])
+    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png, paths.dpp_png; compute_dmumu=cfg[:compute_dmumu], compute_dpp=cfg[:compute_dpp])
     deleted = delete_cache_if_requested(paths.cache_h5, cfg)
     return summary_row(
         energy_GeV,
@@ -1258,6 +1250,15 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         paths.combined_h5,
         "verified combined outputs",
     )
+end
+
+function run_energy_distribution_plots(campaign_root::AbstractString)
+    script_path = joinpath(PIPELINE_ROOT, "scripts", "plot_energy_distribution.py")
+    isfile(script_path) || error("Energy distribution plotter not found: " * script_path)
+    python = get(ENV, "PYTHON", "python")
+    println("Generating campaign energy distribution plots with ", script_path)
+    run(`$python $script_path $campaign_root`)
+    return nothing
 end
 
 function run_campaign(cfg)
@@ -1305,6 +1306,9 @@ function run_campaign(cfg)
     end
 
     write_summary(summary_path, summary_rows)
+    if cfg[:compute_dpp]
+        run_energy_distribution_plots(cfg[:campaign_root])
+    end
     println()
     println("Saved campaign summary to ", summary_path)
     return summary_rows
@@ -1493,12 +1497,10 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
     key in (:boundary, :compute_backend, :particle_selection, :injection_mode, :injection_position_mode, :injection_position_unit) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
-    key == :energy_hist_y_scale && return CombinedFullMod.parse_energy_hist_y_scale(value)
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
     key == :mu_bin_abs && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
-    key in (:energy_hist_x_min, :energy_hist_x_max) && return value === nothing ? nothing : config_float(value, key_name)
     return value
 end
 
@@ -1842,14 +1844,6 @@ function runtime_config()
             cfg[:combined_overrides][:mu_max] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-energy-snapshots=")
             cfg[:combined_overrides][:n_energy_snapshots] = parse(Int, split(argument, "=", limit=2)[2])
-        elseif startswith(argument, "--energy-hist-bins=")
-            cfg[:combined_overrides][:energy_hist_bins] = parse(Int, split(argument, "=", limit=2)[2])
-        elseif startswith(argument, "--energy-hist-y-scale=")
-            cfg[:combined_overrides][:energy_hist_y_scale] = CombinedFullMod.parse_energy_hist_y_scale(split(argument, "=", limit=2)[2])
-        elseif startswith(argument, "--energy-hist-x-min=")
-            cfg[:combined_overrides][:energy_hist_x_min] = parse(Float64, split(argument, "=", limit=2)[2])
-        elseif startswith(argument, "--energy-hist-x-max=")
-            cfg[:combined_overrides][:energy_hist_x_max] = parse(Float64, split(argument, "=", limit=2)[2])
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)

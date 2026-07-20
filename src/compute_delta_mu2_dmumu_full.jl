@@ -43,13 +43,8 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :output_heatmap_png => nothing,
     :output_collapsed_png => nothing,
     :output_dpp_png => nothing,
-    :output_energy_hist_png => nothing,
     :compute_dpp => false,
     :n_energy_snapshots => 5,
-    :energy_hist_bins => 60,
-    :energy_hist_y_scale => :log,
-    :energy_hist_x_min => nothing,
-    :energy_hist_x_max => nothing,
     :use_usetex => false,
 )
 
@@ -251,8 +246,6 @@ function parse_cli_config(args)
     cfg[:output_heatmap_png] === nothing && (cfg[:output_heatmap_png] = joinpath(cfg[:output_dir], "dmumu_mu_tau_full.png"))
     cfg[:output_collapsed_png] === nothing && (cfg[:output_collapsed_png] = joinpath(cfg[:output_dir], "dmumu_tau_average_full.png"))
     cfg[:output_dpp_png] === nothing && (cfg[:output_dpp_png] = joinpath(cfg[:output_dir], "dpp_tau_average_full.png"))
-    cfg[:output_energy_hist_png] === nothing && (cfg[:output_energy_hist_png] = joinpath(cfg[:output_dir], "energy_distribution_snapshots.png"))
-
     return cfg
 end
 
@@ -271,12 +264,6 @@ function build_selected_lag_steps(nsteps::Integer, cfg)
     end
 
     error("Unknown lag_mode: $(cfg[:lag_mode])")
-end
-
-function parse_energy_hist_y_scale(value)
-    scale = Symbol(lowercase(strip(String(value))))
-    scale in (:linear, :log) || error("energy_hist_y_scale must be linear or log.")
-    return scale
 end
 
 function build_mu_edges_full(cfg)
@@ -1064,58 +1051,6 @@ function plot_dpp_tau_full(path_png::AbstractString, tau_norm, dpp_raw_norm, dpp
     return nothing
 end
 
-function energy_histogram_range(values, x_min, x_max)
-    finite_values = Float64[value for value in values if isfinite(value) && value >= 0.0]
-    isempty(finite_values) && error("Cannot plot energy histogram: no finite nonnegative energies.")
-
-    data_min = minimum(finite_values)
-    data_max = maximum(finite_values)
-    lower = x_min === nothing ? data_min : Float64(x_min)
-    upper = x_max === nothing ? data_max : Float64(x_max)
-    lower = max(0.0, lower)
-    upper > lower || error("energy histogram x max must be greater than x min.")
-
-    if x_min === nothing || x_max === nothing
-        span = data_max - data_min
-        padding = span > 0.0 ? 0.05 * span : max(abs(data_max) * 0.01, 1.0e-12)
-        x_min === nothing && (lower = max(0.0, data_min - padding))
-        x_max === nothing && (upper = data_max + padding)
-    end
-
-    upper > lower || (upper = lower + max(abs(lower) * 0.01, 1.0e-12))
-    return lower, upper
-end
-
-function plot_energy_histograms(path_png::AbstractString, snapshot_t_norm, energy_gev; bins::Integer=60, y_scale::Symbol=:log, x_min=nothing, x_max=nothing, use_usetex::Bool=false)
-    mkpath(dirname(path_png))
-    PyPlot.rc("text", usetex=use_usetex)
-    figure(figsize=(7.5, 4.5))
-    snapshot_count = size(energy_gev, 1)
-    all_values = Float64[value for value in vec(energy_gev) if isfinite(value) && value >= 0.0]
-    lower_edge, upper_edge = energy_histogram_range(all_values, x_min, x_max)
-    bin_edges = collect(range(lower_edge, upper_edge, length=max(2, Int(bins) + 1)))
-    for snapshot_index in 1:snapshot_count
-        values = Float64[value for value in energy_gev[snapshot_index, :] if isfinite(value) && value >= 0.0]
-        isempty(values) && continue
-        hist(values, bins=bin_edges, histtype="step", linewidth=1.4, density=false, label=@sprintf("tOmega0 = %.3g", snapshot_t_norm[snapshot_index]))
-    end
-    xlim(lower_edge, upper_edge)
-    if y_scale == :log
-        yscale("log")
-    elseif y_scale != :linear
-        error("Unsupported energy histogram y scale: " * string(y_scale))
-    end
-    xlabel("Kinetic energy [GeV]")
-    ylabel("Particle count per bin")
-    title("Particle energy distribution snapshots")
-    grid(true, alpha=0.25)
-    legend(frameon=false, fontsize=8)
-    tight_layout()
-    savefig(path_png, dpi=200)
-    close("all")
-    return nothing
-end
-
 function plot_dmumu_heatmap_full(
     path_png::AbstractString,
     mu_edges,
@@ -1190,7 +1125,6 @@ function run_combined_full(cfg)
         rm(cfg[:output_collapsed_png]; force=true)
     end
     compute_dpp && mkpath(dirname(cfg[:output_dpp_png]))
-    compute_dpp && mkpath(dirname(cfg[:output_energy_hist_png]))
     compute_dmumu || compute_dpp || error("At least one of compute_dmumu or compute_dpp must be true for combined analysis.")
 
     backend = compute_dmumu ? resolve_backend(cfg) : :not_used
@@ -1488,17 +1422,6 @@ function run_combined_full(cfg)
         if compute_dpp
             plot_dpp_tau_full(cfg[:output_dpp_png], tau_norm, dpp_results.dpp_raw_norm, dpp_results.dpp_centered_norm; use_usetex=cfg[:use_usetex])
             println("Saved D_pp tau plot to ", cfg[:output_dpp_png])
-            plot_energy_histograms(
-                cfg[:output_energy_hist_png],
-                energy_snapshot_results.t_norm,
-                energy_snapshot_results.energy_gev;
-                bins=Int(get(cfg, :energy_hist_bins, 60)),
-                y_scale=parse_energy_hist_y_scale(get(cfg, :energy_hist_y_scale, :log)),
-                x_min=get(cfg, :energy_hist_x_min, nothing),
-                x_max=get(cfg, :energy_hist_x_max, nothing),
-                use_usetex=cfg[:use_usetex],
-            )
-            println("Saved energy histogram plot to ", cfg[:output_energy_hist_png])
         end
     end
 

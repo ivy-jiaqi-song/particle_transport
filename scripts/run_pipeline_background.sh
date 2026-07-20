@@ -17,7 +17,14 @@ mkdir -p "$LOG_DIR"
 LOG_PATH="$LOG_DIR/pipeline_${SAFE_LABEL}_${TIMESTAMP}.log"
 PID_PATH="$LOG_DIR/pipeline_${SAFE_LABEL}_${TIMESTAMP}.pid"
 
-nohup bash "$SCRIPT_DIR/run_pipeline.sh" "$@" > "$LOG_PATH" 2>&1 &
+{
+    echo "Starting pipeline at $(date -Is)"
+    echo "Repository: $REPO_DIR"
+    echo "Command: bash $SCRIPT_DIR/run_pipeline.sh $*"
+    echo
+} > "$LOG_PATH"
+
+nohup bash "$SCRIPT_DIR/run_pipeline.sh" "$@" >> "$LOG_PATH" 2>&1 &
 PID="$!"
 printf '%s\n' "$PID" > "$PID_PATH"
 

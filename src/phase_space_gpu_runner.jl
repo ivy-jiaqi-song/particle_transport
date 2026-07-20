@@ -30,6 +30,11 @@ const CFG = Dict{Symbol, Any}(
     :precision => Float64,
     :field_subset => nothing,
     :boundary => :periodic,   # :open or :periodic
+    :injection_mode => :isotropic,
+    :injection_mu0 => 0.0,
+    :injection_position_mode => :random,
+    :injection_position => (0.5, 0.5, 0.5),
+    :injection_position_unit => :box_fraction,
     :trajectory_time_stride => 1,
     :trajectory_output_precision => Float32,
     :progress_every => 5000,
@@ -51,6 +56,33 @@ function rand_unit_vector(rng, ::Type{T}) where {T<:AbstractFloat}
     phi = T(2 * pi * rand(rng))
     r = sqrt(max(zero(T), one(T) - z^2))
     return (r * cos(phi), r * sin(phi), z)
+end
+
+function injection_mode(cfg)
+    mode = get(cfg, :injection_mode, :isotropic)
+    mode = mode isa Symbol ? mode : Symbol(replace(lowercase(strip(String(mode))), "-" => "_"))
+    mode in (:isotropic, :fixed_mu) || error("injection_mode must be isotropic or fixed-mu")
+    return mode
+end
+
+function injection_position_mode(cfg)
+    mode = get(cfg, :injection_position_mode, :random)
+    mode = mode isa Symbol ? mode : Symbol(replace(lowercase(strip(String(mode))), "-" => "_"))
+    mode in (:random, :fixed) || error("injection_position_mode must be random or fixed")
+    return mode
+end
+
+function injection_position_unit(cfg)
+    unit = get(cfg, :injection_position_unit, :box_fraction)
+    unit = unit isa Symbol ? unit : Symbol(replace(lowercase(strip(String(unit))), "-" => "_"))
+    unit in (:box_fraction, :m, :pc) || error("injection_position_unit must be box-fraction, m, or pc")
+    return unit
+end
+
+function injection_position_tuple(cfg, ::Type{T}) where {T<:AbstractFloat}
+    raw = get(cfg, :injection_position, (0.5, 0.5, 0.5))
+    length(raw) == 3 || error("injection_position must contain exactly three values")
+    return (T(raw[1]), T(raw[2]), T(raw[3]))
 end
 
 function load_static_fields(cfg, ::Type{T}) where {T<:AbstractFloat}
@@ -94,7 +126,67 @@ function estimate_min_dx(x, y, z)
     return min(minimum(diff(x)), minimum(diff(y)), minimum(diff(z)))
 end
 
-function init_particles(cfg, x, y, z, gamma0, v0, ::Type{T}) where {T<:AbstractFloat}
+function write_injection_metadata!(file, cfg)
+    file["injection_mode"] = string(injection_mode(cfg))
+    file["injection_mu0"] = Float64[get(cfg, :injection_mu0, 0.0)]
+    file["injection_position_mode"] = string(injection_position_mode(cfg))
+    file["injection_position"] = Float64[Float64(v) for v in injection_position_tuple(cfg, Float64)]
+    file["injection_position_unit"] = string(injection_position_unit(cfg))
+    return nothing
+end
+
+function fixed_injection_position(cfg, x, y, z, ::Type{T}) where {T<:AbstractFloat}
+    xmin, xmax = x[1], x[end]
+    ymin, ymax = y[1], y[end]
+    zmin, zmax = z[1], z[end]
+    px, py, pz = injection_position_tuple(cfg, T)
+    unit = injection_position_unit(cfg)
+
+    if unit == :box_fraction
+        xi = xmin + px * (xmax - xmin)
+        yi = ymin + py * (ymax - ymin)
+        zi = zmin + pz * (zmax - zmin)
+    elseif unit == :pc
+        xi = px * T(PC_TO_M)
+        yi = py * T(PC_TO_M)
+        zi = pz * T(PC_TO_M)
+    else
+        xi, yi, zi = px, py, pz
+    end
+
+    if !(xmin <= xi <= xmax && ymin <= yi <= ymax && zmin <= zi <= zmax)
+        error("fixed injection position is outside the simulation box")
+    end
+    return xi, yi, zi
+end
+
+function fixed_mu_unit_vector(rng, bx, by, bz, mu0, ::Type{T}) where {T<:AbstractFloat}
+    bn = sqrt(bx * bx + by * by + bz * bz)
+    (!isfinite(bn) || bn == zero(T)) && error("cannot use fixed-mu injection where local B is zero or non-finite")
+    bhx, bhy, bhz = bx / bn, by / bn, bz / bn
+
+    if abs(bhx) < T(0.9)
+        e1x, e1y, e1z = zero(T), bhz, -bhy
+    else
+        e1x, e1y, e1z = -bhz, zero(T), bhx
+    end
+    e1n = sqrt(e1x * e1x + e1y * e1y + e1z * e1z)
+    e1x, e1y, e1z = e1x / e1n, e1y / e1n, e1z / e1n
+    e2x = bhy * e1z - bhz * e1y
+    e2y = bhz * e1x - bhx * e1z
+    e2z = bhx * e1y - bhy * e1x
+
+    phi = T(2 * pi * rand(rng))
+    perp = sqrt(max(zero(T), one(T) - mu0 * mu0))
+    cphi, sphi = cos(phi), sin(phi)
+    return (
+        mu0 * bhx + perp * (cphi * e1x + sphi * e2x),
+        mu0 * bhy + perp * (cphi * e1y + sphi * e2y),
+        mu0 * bhz + perp * (cphi * e1z + sphi * e2z),
+    )
+end
+
+function init_particles(cfg, x, y, z, gamma0, v0, ::Type{T}, Bx=nothing, By=nothing, Bz=nothing) where {T<:AbstractFloat}
     rng = MersenneTwister(cfg[:seed])
     n = cfg[:n_particles]
     x1 = Vector{T}(undef, n)
@@ -106,16 +198,40 @@ function init_particles(cfg, x, y, z, gamma0, v0, ::Type{T}) where {T<:AbstractF
     xmin, xmax = x[1], x[end]
     ymin, ymax = y[1], y[end]
     zmin, zmax = z[1], z[end]
+    dx_grid = x[2] - x[1]
+    dy_grid = y[2] - y[1]
+    dz_grid = z[2] - z[1]
+    nx, ny, nz = length(x), length(y), length(z)
     pscale = gamma0 * T(M_P) * v0
+    pos_mode = injection_position_mode(cfg)
+    mom_mode = injection_mode(cfg)
+    fixed_pos = pos_mode == :fixed ? fixed_injection_position(cfg, x, y, z, T) : nothing
+    mu0 = T(get(cfg, :injection_mu0, 0.0))
+    if mom_mode == :fixed_mu
+        -one(T) <= mu0 <= one(T) || error("injection_mu0 must be in [-1, 1]")
+        (Bx === nothing || By === nothing || Bz === nothing) && error("fixed-mu injection requires magnetic field arrays")
+    end
 
     for i in 1:n
-        dx, dy, dz = rand_unit_vector(rng, T)
-        x1[i] = rand(rng, T) * (xmax - xmin) + xmin
-        x2[i] = rand(rng, T) * (ymax - ymin) + ymin
-        x3[i] = rand(rng, T) * (zmax - zmin) + zmin
-        p1[i] = pscale * dx
-        p2[i] = pscale * dy
-        p3[i] = pscale * dz
+        if fixed_pos === nothing
+            x1[i] = rand(rng, T) * (xmax - xmin) + xmin
+            x2[i] = rand(rng, T) * (ymax - ymin) + ymin
+            x3[i] = rand(rng, T) * (zmax - zmin) + zmin
+        else
+            x1[i], x2[i], x3[i] = fixed_pos
+        end
+
+        if mom_mode == :fixed_mu
+            bx = trilinear_sample(Bx, x1[i], x2[i], x3[i], xmin, ymin, zmin, dx_grid, dy_grid, dz_grid, nx, ny, nz)
+            by = trilinear_sample(By, x1[i], x2[i], x3[i], xmin, ymin, zmin, dx_grid, dy_grid, dz_grid, nx, ny, nz)
+            bz = trilinear_sample(Bz, x1[i], x2[i], x3[i], xmin, ymin, zmin, dx_grid, dy_grid, dz_grid, nx, ny, nz)
+            ux, uy, uz = fixed_mu_unit_vector(rng, bx, by, bz, mu0, T)
+        else
+            ux, uy, uz = rand_unit_vector(rng, T)
+        end
+        p1[i] = pscale * ux
+        p2[i] = pscale * uy
+        p3[i] = pscale * uz
     end
 
     return x1, x2, x3, p1, p2, p3
@@ -316,6 +432,7 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     file["trajectory_output_precision"] = string(writer.outtype)
     file["position_unit"] = "m"
     file["momentum_unit"] = "kg*m/s"
+    write_injection_metadata!(file, cfg)
     close(file)
 end
 
@@ -357,7 +474,7 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
     save_indices = sampled_step_indices(nsteps, trajectory_stride)
     nsave = length(save_indices)
 
-    x1, x2, x3, p1, p2, p3 = init_particles(cfg, x, y, z, gamma0, v0, T)
+    x1, x2, x3, p1, p2, p3 = init_particles(cfg, x, y, z, gamma0, v0, T, Bx, By, Bz)
     dx1 = CuArray(x1)
     dx2 = CuArray(x2)
     dx3 = CuArray(x3)

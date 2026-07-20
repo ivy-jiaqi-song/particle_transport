@@ -75,7 +75,10 @@ The current public config layout is:
 - `[run]`
   - `cache_mode`: `phase-space` records positions and momenta; `mu` writes a
     compact pitch-angle cache for D_mumu-focused runs.
-  - `compute_dmumu`: set `false` to stop after trajectory/cache generation.
+  - `compute_dmumu`: set `false` to skip `D_mumu` and `delta_mu2` products;
+    if `compute_dpp` is also `false`, the run stops after cache generation.
+  - `compute_dpp`: set `true` to compute global momentum diffusion and energy
+    snapshot histograms; this automatically uses `phase-space` cache output.
   - `mode_decomposition_available`: `true` means files such as
     `<stem>_alfven.h5`, `<stem>_fast.h5`, and `<stem>_slow.h5` exist. `false`
     means only the total input file is used.
@@ -85,6 +88,14 @@ The current public config layout is:
 - `[particles]`
   - Physical trajectory settings: field dataset names, velocity unit, box size,
     eta, integration time, boundary behavior.
+  - Injection controls: `injection_position_mode = "random"` keeps the existing
+    random-in-box start positions; `"fixed"` uses `injection_position`. With
+    `injection_position_unit = "box-fraction"`, `[0.5, 0.5, 0.5]` is the box
+    center. Units `"pc"` and `"m"` are also accepted.
+  - Momentum injection defaults to `injection_mode = "isotropic"`. Set
+    `injection_mode = "fixed-mu"` and `injection_mu0 = VALUE` to inject every
+    particle with the requested pitch-angle cosine relative to the local
+    magnetic field while keeping gyrophase random.
   - Particle and cache burden settings: particle count, precision, field subset,
     saved time stride, output precision.
 
@@ -94,6 +105,15 @@ The current public config layout is:
     `particles = "all"` uses all cached particles. Lag settings still apply in
     both cases.
   - Lag sampling, mu binning, backend, chunk size, and safety-limit controls.
+  - `mu_bin_abs = true` bins D_mumu by `abs(mu_start)` over `mu_min = 0.0` to
+    `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
+
+- `[dpp]`
+  - Optional controls for global `D_pp` runs: `n_energy_snapshots` controls how
+    many energy snapshots are stored in each per-energy HDF5 file.
+  - When `compute_dpp = true`, the pipeline also runs
+    `scripts/plot_energy_distribution.py` after each campaign to build
+    campaign-level energy-distribution figures.
 
 Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
 but new configs should use the generic `[input]` form.
@@ -179,6 +199,13 @@ Useful runtime flags:
 - `--modes=alfven,fast` or `--mode=alfven`
 - `--campaign=mp/0_5/alfven`
 - `--energy=1e5` or `--energies=1e5,1e6,1e7`
+- `--dmumu-start-mode=injection` for injection-anchored D_mumu bins using
+  `Delta mu = mu(tau) - mu(0)` and binning by injected `mu(0)`.
+- `--mu-bin-abs` or `[dmumu].mu_bin_abs = true` to bin by `abs(mu_start)`.
+  With `dmumu_start_mode=injection`, this gives `|mu_0|` bins from 0 to 1.
+- `--n-mu-bins=N --mu-min=0 --mu-max=1` to control the D_mumu bin axis.
+- `--lag-mode=stride --min-lag-steps=MIN --lag-step-stride=STRIDE` to use
+  lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
 - `--cache-mode=mu` or `--cache-mode=phase-space`
 - `--compute-dmumu` or `--no-compute-dmumu`
 - `--keep-caches`
@@ -207,11 +234,64 @@ Each energy folder contains:
 - `delta_mu2_curve_full.png`
 - `dmumu_mu_tau_full.png`
 - `dmumu_tau_average_full.png`
+- `dpp_tau_average_full.png` when `compute_dpp = true`
 
 Each campaign folder also contains `campaign_summary.tsv`. Intermediate cache
 files live under each campaign's `cache/` folder. They are deleted after a
 successful D_mumu run when `delete_cache_on_success = true`; cache-only runs
 keep the cache because it is the final product.
+
+When `compute_dpp = true`, each campaign folder also contains:
+
+- `energy_distribution_evolution_1e5.png`
+- `energy_distribution_evolution_1e6.png`
+- `energy_distribution_evolution_1e7.png`
+- `energy_distribution_comparison.png`
+- `energy_distribution_summary.tsv`
+
+By default, D_mumu uses the sliding start-time estimator: for each lag it bins
+by `mu(t)` and accumulates `Delta mu = mu(t + tau) - mu(t)` over all valid start
+times. With `dmumu_start_mode = "injection"`, each particle contributes at most
+one pair per lag, binned by `mu(0)` with `Delta mu = mu(tau) - mu(0)`. The
+selected lag grid is still controlled by `lag_mode`, `min_lag_steps`,
+`max_lag_steps`, and `lag_step_stride`/`n_lag_samples`.
+
+When `mu_bin_abs = true`, only the bin coordinate changes: sliding mode bins by
+`|mu(t)|`, injection mode bins by `|mu(0)|`, and the generated D_mumu plots use
+a 0 to 1 `|mu|` axis.
+
+When `compute_dpp = true`, the phase-space postprocessor also computes global
+scalar momentum diffusion with `p = sqrt(px^2 + py^2 + pz^2)`,
+`Delta p = p(t + tau) - p(t)`, and normalized output
+`D_pp/(p0^2 Omega0) = Var(Delta p / p0) / (2 tau Omega0)`. It also saves
+evenly spaced kinetic-energy snapshots in the HDF5 `energy_snapshots` group.
+After all configured energies in a campaign finish, the pipeline plots the
+energy-distribution evolution with `scripts/plot_energy_distribution.py`.
+
+The energy-distribution plotter uses a fixed recipe so different campaigns are
+directly comparable: 200 step-histogram bins over the finite energy range padded
+by 10%, a log y-axis with empty bins clipped to count 1, true GeV x-axis labels
+with Matplotlib offset text disabled, and up to six snapshots selected as
+`[0, 1, 10, 50, 200, last]` with evenly spaced fill-ins when needed. The
+comparison figure uses `Delta E / E0`, allowing `1e5`, `1e6`, and `1e7` runs to
+share one x-axis.
+
+The plotter can also be run manually on existing campaign outputs:
+
+```bash
+python scripts/plot_energy_distribution.py outputs/campaigns_cache/phase_space/iso/0_9/total
+python scripts/plot_energy_distribution.py outputs/campaigns_cache/phase_space/iso/0_9/total 1e5 1e6
+```
+
+It supports both retained phase-space caches under `cache/phase_space_*.h5` and
+post-cleanup per-energy `delta_mu2_dmumu_full.h5` files containing the
+`energy_snapshots` group.
+
+To support a new energy-data layout, add a loader function in
+`scripts/plot_energy_distribution.py` and append it to `LOADERS`. A loader
+should return `(E, t_s, source)` where `E` is shaped `(n_snapshots, n_particles)`
+in GeV and `t_s` contains snapshot times in seconds; return `None` when that
+layout is absent so the next loader can try.
 
 ## Comparison Figures
 

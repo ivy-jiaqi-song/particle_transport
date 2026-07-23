@@ -33,6 +33,7 @@ compute_dmumu = true
 
 # Compute global D_pp and energy-distribution snapshots. This requires the
 # phase-space cache; the runner switches cache_mode to "phase-space" when true.
+# D_pp writes dpp_full.h5 separately from the D_mumu product.
 compute_dpp = false
 
 # Mode repetition logic. If true, the input directory contains mode files with
@@ -139,8 +140,18 @@ allow_huge = true
 use_usetex = false
 
 [dpp]
-# Global D_pp uses scalar p = sqrt(px^2 + py^2 + pz^2) over the same selected
-# particles and lag grid as D_mumu. The pipeline writes energy snapshots into
-# each delta_mu2_dmumu_full.h5 file, then builds campaign-level energy
-# distribution figures with scripts/plot_energy_distribution.py.
+# Global D_pp uses scalar p = sqrt(px^2 + py^2 + pz^2) from the phase-space
+# cache. These controls are independent from [dmumu]; [particles] still controls
+# the generated physical ensemble and trajectory parameters shared by both.
+particle_chunk_size = 128
+first_particle = 1
+n_particles_to_use = 10000
+particle_selection = "block-random"
+particle_seed = 20260423
+particle_block_size = 128
+lag_mode = "uniform-samples"
+min_lag_steps = 1
+n_lag_samples = 40
+max_lag_steps = "none"
+lag_step_stride = 1
 n_energy_snapshots = 5

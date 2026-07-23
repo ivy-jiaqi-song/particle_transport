@@ -6,11 +6,11 @@ The script auto-detects either supported campaign layout:
 
 1. Direct pipeline campaign root:
    <campaign>/cache/phase_space_<energy_dir>.h5
-   <campaign>/<energy_dir>/delta_mu2_dmumu_full.h5
+   <campaign>/<energy_dir>/dpp_full.h5
 
 2. Legacy helper layout:
    <campaign>/total/cache/phase_space_<energy_dir>.h5
-   <campaign>/total/<energy_dir>/delta_mu2_dmumu_full.h5
+   <campaign>/total/<energy_dir>/dpp_full.h5
 
 Outputs are written beside the detected cache/energy folders.
 """
@@ -72,19 +72,19 @@ def load_from_cache_phase_space(base_total: str, energy_dir: str):
     return energy_gev, t_s, f"cache/phase_space_{energy_dir}.h5 (momenta, kg*m/s -> GeV)"
 
 
-def load_from_delta_energy_snapshots(base_total: str, energy_dir: str):
-    path = os.path.join(base_total, energy_dir, "delta_mu2_dmumu_full.h5")
+def load_from_dpp_energy_snapshots(base_total: str, energy_dir: str):
+    path = os.path.join(base_total, energy_dir, "dpp_full.h5")
     if not os.path.isfile(path):
         return None
     with h5py.File(path, "r") as handle:
         energy_gev = handle["energy_snapshots/energy_GeV"][:]
         t_s = handle["energy_snapshots/snapshot_t_s"][:]
-    return energy_gev.T, t_s, f"{energy_dir}/delta_mu2_dmumu_full.h5 (energy_GeV, already GeV)"
+    return energy_gev.T, t_s, f"{energy_dir}/dpp_full.h5 (energy_GeV, already GeV)"
 
 
 LOADERS = [
     load_from_cache_phase_space,
-    load_from_delta_energy_snapshots,
+    load_from_dpp_energy_snapshots,
 ]
 
 

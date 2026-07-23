@@ -78,7 +78,8 @@ The current public config layout is:
   - `compute_dmumu`: set `false` to skip `D_mumu` and `delta_mu2` products;
     if `compute_dpp` is also `false`, the run stops after cache generation.
   - `compute_dpp`: set `true` to compute global momentum diffusion and energy
-    snapshot histograms; this automatically uses `phase-space` cache output.
+    snapshot histograms into a separate `dpp_full.h5`; this automatically uses
+    `phase-space` cache output.
   - `mode_decomposition_available`: `true` means files such as
     `<stem>_alfven.h5`, `<stem>_fast.h5`, and `<stem>_slow.h5` exist. `false`
     means only the total input file is used.
@@ -109,8 +110,8 @@ The current public config layout is:
     `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
 
 - `[dpp]`
-  - Optional controls for global `D_pp` runs: `n_energy_snapshots` controls how
-    many energy snapshots are stored in each per-energy HDF5 file.
+  - Optional controls for global `D_pp` runs: particle selection, lag sampling,
+    and `n_energy_snapshots` are independent from `[dmumu]`.
   - When `compute_dpp = true`, the pipeline also runs
     `scripts/plot_energy_distribution.py` after each campaign to build
     campaign-level energy-distribution figures.
@@ -201,11 +202,13 @@ Useful runtime flags:
 - `--energy=1e5` or `--energies=1e5,1e6,1e7`
 - `--dmumu-start-mode=injection` for injection-anchored D_mumu bins using
   `Delta mu = mu(tau) - mu(0)` and binning by injected `mu(0)`.
-- `--mu-bin-abs` or `[dmumu].mu_bin_abs = true` to bin by `abs(mu_start)`.
+- `--dmumu-mu-bin-abs` or `[dmumu].mu_bin_abs = true` to bin by `abs(mu_start)`.
   With `dmumu_start_mode=injection`, this gives `|mu_0|` bins from 0 to 1.
-- `--n-mu-bins=N --mu-min=0 --mu-max=1` to control the D_mumu bin axis.
-- `--lag-mode=stride --min-lag-steps=MIN --lag-step-stride=STRIDE` to use
-  lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
+- `--dmumu-n-mu-bins=N --dmumu-mu-min=0 --dmumu-mu-max=1` to control the D_mumu bin axis.
+- `--dmumu-lag-mode=stride --dmumu-min-lag-steps=MIN --dmumu-lag-step-stride=STRIDE` to use
+  D_mumu lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
+- `--dpp-lag-mode=stride --dpp-min-lag-steps=MIN --dpp-lag-step-stride=STRIDE` to control
+  the independent D_pp lag grid.
 - `--cache-mode=mu` or `--cache-mode=phase-space`
 - `--compute-dmumu` or `--no-compute-dmumu`
 - `--keep-caches`
@@ -234,7 +237,8 @@ Each energy folder contains:
 - `delta_mu2_curve_full.png`
 - `dmumu_mu_tau_full.png`
 - `dmumu_tau_average_full.png`
-- `dpp_tau_average_full.png` when `compute_dpp = true`
+- `dpp_full.h5` when `compute_dpp = true`
+- `dpp_tau_curve_full.png` when `compute_dpp = true`
 
 Each campaign folder also contains `campaign_summary.tsv`. Intermediate cache
 files live under each campaign's `cache/` folder. They are deleted after a
@@ -253,8 +257,9 @@ By default, D_mumu uses the sliding start-time estimator: for each lag it bins
 by `mu(t)` and accumulates `Delta mu = mu(t + tau) - mu(t)` over all valid start
 times. With `dmumu_start_mode = "injection"`, each particle contributes at most
 one pair per lag, binned by `mu(0)` with `Delta mu = mu(tau) - mu(0)`. The
-selected lag grid is still controlled by `lag_mode`, `min_lag_steps`,
-`max_lag_steps`, and `lag_step_stride`/`n_lag_samples`.
+selected D_mumu lag grid is controlled by `[dmumu].lag_mode`,
+`[dmumu].min_lag_steps`, `[dmumu].max_lag_steps`, and
+`[dmumu].lag_step_stride`/`[dmumu].n_lag_samples`.
 
 When `mu_bin_abs = true`, only the bin coordinate changes: sliding mode bins by
 `|mu(t)|`, injection mode bins by `|mu(0)|`, and the generated D_mumu plots use
@@ -264,7 +269,7 @@ When `compute_dpp = true`, the phase-space postprocessor also computes global
 scalar momentum diffusion with `p = sqrt(px^2 + py^2 + pz^2)`,
 `Delta p = p(t + tau) - p(t)`, and normalized output
 `D_pp/(p0^2 Omega0) = Var(Delta p / p0) / (2 tau Omega0)`. It also saves
-evenly spaced kinetic-energy snapshots in the HDF5 `energy_snapshots` group.
+evenly spaced kinetic-energy snapshots in the `dpp_full.h5` `energy_snapshots` group.
 After all configured energies in a campaign finish, the pipeline plots the
 energy-distribution evolution with `scripts/plot_energy_distribution.py`.
 

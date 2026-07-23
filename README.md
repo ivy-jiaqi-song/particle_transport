@@ -101,17 +101,20 @@ The current public config layout is:
     saved time stride, output precision.
 
 - `[dmumu]`
-  - Optional transport-analysis settings.
+  - D_mumu-only transport-analysis settings.
   - `particles = "sample"` uses `n_particles_to_use` and `particle_selection`.
     `particles = "all"` uses all cached particles. Lag settings still apply in
     both cases.
-  - Lag sampling, mu binning, backend, chunk size, and safety-limit controls.
+  - Lag sampling, particle sampling, mu binning, backend, chunk size, and
+    safety-limit controls are independent from `[dpp]`.
   - `mu_bin_abs = true` bins D_mumu by `abs(mu_start)` over `mu_min = 0.0` to
     `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
 
 - `[dpp]`
-  - Optional controls for global `D_pp` runs: particle selection, lag sampling,
-    and `n_energy_snapshots` are independent from `[dmumu]`.
+  - D_pp-only controls: particle selection, lag sampling, chunk size, and
+    `n_energy_snapshots` are independent from `[dmumu]`.
+  - D_pp is a one-dimensional function of lag, `D_pp(tau)`, so its figure is
+    named `dpp_tau_curve_full.png` rather than a tau-average product.
   - When `compute_dpp = true`, the pipeline also runs
     `scripts/plot_energy_distribution.py` after each campaign to build
     campaign-level energy-distribution figures.
@@ -186,6 +189,19 @@ julia run_pipeline.jl --config=configs/run_config.local.toml --campaign=mp/0_5/a
 julia run_pipeline.jl --config=configs/run_config.local.toml --no-compute-dmumu --cache-mode=phase-space
 ```
 
+Standalone postprocessing from retained phase-space caches:
+
+```bash
+julia src/compute_delta_mu2_dmumu_full.jl --trajectory-h5=/path/to/phase_space_100000_GeV.h5 --turbulence-h5=/path/to/turbulence.h5 --output-dir=/path/to/dmumu_out
+julia src/compute_dpp_full.jl --trajectory-h5=/path/to/phase_space_100000_GeV.h5 --output-dir=/path/to/dpp_out
+```
+
+The D_mumu standalone path reconstructs `mu(t)`, so it needs both the
+phase-space cache and the turbulence HDF5. The D_pp standalone path reads only
+the phase-space cache momenta plus time metadata. Direct D_mumu-only
+postprocessing from a compact `mu_cache_*.h5` is not exposed as a standalone
+script; the pipeline uses that path internally when `cache_mode = "mu"`.
+
 Useful runtime flags:
 
 - `--config=PATH`
@@ -209,8 +225,11 @@ Useful runtime flags:
   D_mumu lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
 - `--dpp-lag-mode=stride --dpp-min-lag-steps=MIN --dpp-lag-step-stride=STRIDE` to control
   the independent D_pp lag grid.
+- `--dmumu-n-particles=N` and `--dpp-n-particles=N` to choose independent
+  estimator particle subsets from the same generated cache.
 - `--cache-mode=mu` or `--cache-mode=phase-space`
 - `--compute-dmumu` or `--no-compute-dmumu`
+- `--compute-dpp` or `--no-compute-dpp`
 - `--keep-caches`
 - `--regenerate-caches`
 - `--force-recompute`
@@ -241,9 +260,18 @@ Each energy folder contains:
 - `dpp_tau_curve_full.png` when `compute_dpp = true`
 
 Each campaign folder also contains `campaign_summary.tsv`. Intermediate cache
-files live under each campaign's `cache/` folder. They are deleted after a
-successful D_mumu run when `delete_cache_on_success = true`; cache-only runs
-keep the cache because it is the final product.
+files live under each campaign's `cache/` folder. They are deleted only after
+all requested products for that energy are verified when
+`delete_cache_on_success = true`; cache-only or partial-failure runs keep the
+cache.
+
+`campaign_summary.tsv` records product status separately with columns for
+`dmumu_h5`, `dpp_h5`, `dmumu_status`, `dpp_status`, `dmumu_note`, and
+`dpp_note`. A D_mumu failure does not prevent the requested D_pp product from
+running, and a D_pp failure does not prevent the requested D_mumu product from
+running. With `stop_on_error = true`, the campaign stops after both requested
+products for the current energy have been attempted and the summary row has
+been written.
 
 When `compute_dpp = true`, each campaign folder also contains:
 
@@ -289,8 +317,8 @@ python scripts/plot_energy_distribution.py outputs/campaigns_cache/phase_space/i
 ```
 
 It supports both retained phase-space caches under `cache/phase_space_*.h5` and
-post-cleanup per-energy `delta_mu2_dmumu_full.h5` files containing the
-`energy_snapshots` group.
+post-cleanup per-energy `dpp_full.h5` files containing the `energy_snapshots`
+group.
 
 To support a new energy-data layout, add a loader function in
 `scripts/plot_energy_distribution.py` and append it to `LOADERS`. A loader

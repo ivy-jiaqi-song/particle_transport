@@ -688,14 +688,30 @@ function delete_cache_if_requested(path_h5::AbstractString, cfg)
     return false
 end
 
-function summary_row(energy_GeV, status::AbstractString, deleted::Bool, cache_path::AbstractString, combined_h5::AbstractString, dpp_h5::AbstractString, note::AbstractString)
+function summary_row(
+    energy_GeV,
+    status::AbstractString,
+    deleted::Bool,
+    cache_path::AbstractString,
+    dmumu_h5::AbstractString,
+    dpp_h5::AbstractString,
+    dmumu_status::AbstractString,
+    dpp_status::AbstractString,
+    dmumu_note::AbstractString,
+    dpp_note::AbstractString,
+    note::AbstractString,
+)
     return (
         energy_GeV = Float64(energy_GeV),
         status = status,
         deleted = deleted,
         cache_path = cache_path,
-        combined_h5 = combined_h5,
+        dmumu_h5 = dmumu_h5,
         dpp_h5 = dpp_h5,
+        dmumu_status = dmumu_status,
+        dpp_status = dpp_status,
+        dmumu_note = dmumu_note,
+        dpp_note = dpp_note,
         note = note,
     )
 end
@@ -703,7 +719,7 @@ end
 function write_summary(path::AbstractString, rows)
     ensure_parent(path)
     open(path, "w") do io
-        println(io, "energy_GeV\tstatus\tcache_deleted\tcache_path\tcombined_h5\tdpp_h5\tnote")
+        println(io, "energy_GeV\tstatus\tcache_deleted\tcache_path\tdmumu_h5\tdpp_h5\tdmumu_status\tdpp_status\tdmumu_note\tdpp_note\tnote")
         for row in rows
             println(
                 io,
@@ -712,8 +728,12 @@ function write_summary(path::AbstractString, rows)
                     row.status,
                     row.deleted ? "true" : "false",
                     row.cache_path,
-                    row.combined_h5,
+                    row.dmumu_h5,
                     row.dpp_h5,
+                    row.dmumu_status,
+                    row.dpp_status,
+                    replace(row.dmumu_note, '\n' => ' '),
+                    replace(row.dpp_note, '\n' => ' '),
                     replace(row.note, '\n' => ' '),
                 ), '\t'),
             )
@@ -1171,6 +1191,49 @@ function run_combined_from_mu_cache(cfg)
     return nothing
 end
 
+function throwable_note(error_instance, backtrace_value)
+    return sprint(showerror, error_instance, backtrace_value)
+end
+
+function requested_status(compute_product::Bool, complete::Bool)
+    compute_product || return "disabled"
+    complete && return "skipped_existing"
+    return "pending"
+end
+
+function product_success(status::AbstractString)
+    return status in ("disabled", "skipped_existing", "ok")
+end
+
+function run_dmumu_product!(cfg, paths)
+    if cfg[:cache_mode] == :phase_space
+        CombinedFullMod.run_combined_full(cfg)
+        append_cache_metadata!(paths.combined_h5, :phase_space, paths.cache_h5)
+    else
+        run_combined_from_mu_cache(cfg)
+    end
+    verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png)
+    return nothing
+end
+
+function run_dpp_product!(cfg, paths)
+    cfg[:cache_mode] == :phase_space || error("D_pp requires phase-space cache mode.")
+    DppFullMod.run_dpp_full(cfg)
+    verify_dpp_outputs(paths.dpp_h5, paths.dpp_png)
+    return nothing
+end
+
+function overall_product_status(dmumu_status::AbstractString, dpp_status::AbstractString)
+    if dmumu_status == "error" || dpp_status == "error"
+        return "error"
+    elseif dmumu_status == "ok" || dpp_status == "ok"
+        return "ok"
+    elseif dmumu_status == "skipped_existing" || dpp_status == "skipped_existing"
+        return "skipped_existing_outputs"
+    end
+    return "cache_only"
+end
+
 function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     paths = build_energy_paths(cfg, energy_GeV)
     mkpath(paths.cache_dir)
@@ -1193,12 +1256,21 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             paths.cache_h5,
             "",
             "",
+            "disabled",
+            "disabled",
+            "",
+            "",
             "verified existing cache; transport analysis disabled",
         )
     end
 
-    dmumu_complete = !cfg[:compute_dmumu] || dmumu_outputs_complete(paths, requested_dmumu_cfg)
-    dpp_complete = !cfg[:compute_dpp] || dpp_outputs_complete(paths, requested_dpp_cfg)
+    dmumu_complete = !cfg[:compute_dmumu] || (cfg[:skip_completed_outputs] && dmumu_outputs_complete(paths, requested_dmumu_cfg))
+    dpp_complete = !cfg[:compute_dpp] || (cfg[:skip_completed_outputs] && dpp_outputs_complete(paths, requested_dpp_cfg))
+    dmumu_status = requested_status(cfg[:compute_dmumu], dmumu_complete)
+    dpp_status = requested_status(cfg[:compute_dpp], dpp_complete)
+    dmumu_note = dmumu_status == "skipped_existing" ? "verified existing D_mumu outputs" : ""
+    dpp_note = dpp_status == "skipped_existing" ? "verified existing D_pp outputs" : ""
+
     if cfg[:skip_completed_outputs] && dmumu_complete && dpp_complete
         metadata_path = isfile(paths.cache_h5) ? paths.cache_h5 : (cfg[:compute_dmumu] ? paths.combined_h5 : paths.dpp_h5)
         verify_cache_injection_metadata(metadata_path, base_runner_cfg)
@@ -1208,7 +1280,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
             deleted = delete_cache_if_requested(paths.cache_h5, cfg)
         end
-        println("Combined outputs already verified; skipping energy ", energy_GeV, " GeV")
+        println("Requested outputs already verified; skipping energy ", energy_GeV, " GeV")
         return summary_row(
             energy_GeV,
             "skipped_existing_outputs",
@@ -1216,6 +1288,10 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             paths.cache_h5,
             paths.combined_h5,
             paths.dpp_h5,
+            dmumu_status,
+            dpp_status,
+            dmumu_note,
+            dpp_note,
             "verified existing requested outputs",
         )
     end
@@ -1251,6 +1327,10 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             paths.cache_h5,
             "",
             "",
+            "disabled",
+            "disabled",
+            "",
+            "",
             "verified cache; transport analysis disabled",
         )
     end
@@ -1282,35 +1362,58 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         ),
     )
 
-    if cfg[:compute_dmumu]
-        if cfg[:cache_mode] == :phase_space
-            CombinedFullMod.run_combined_full(dmumu_cfg)
-            append_cache_metadata!(paths.combined_h5, :phase_space, paths.cache_h5)
-        else
-            run_combined_from_mu_cache(dmumu_cfg)
+    if cfg[:compute_dmumu] && !dmumu_complete
+        try
+            run_dmumu_product!(dmumu_cfg, paths)
+            dmumu_status = "ok"
+            dmumu_note = "verified D_mumu outputs"
+        catch error_instance
+            dmumu_status = "error"
+            dmumu_note = throwable_note(error_instance, catch_backtrace())
+            println("D_mumu failed for energy ", energy_GeV, " GeV; continuing with other requested products.")
+            println(dmumu_note)
         end
-        verify_combined_outputs(paths.combined_h5, paths.delta_png, paths.dmumu_heatmap_png, paths.dmumu_collapsed_png)
-    else
+    elseif !cfg[:compute_dmumu]
         rm(paths.delta_png; force=true)
         rm(paths.dmumu_heatmap_png; force=true)
         rm(paths.dmumu_collapsed_png; force=true)
     end
 
-    if cfg[:compute_dpp]
-        cfg[:cache_mode] == :phase_space || error("D_pp requires phase-space cache mode.")
-        DppFullMod.run_dpp_full(dpp_cfg)
-        verify_dpp_outputs(paths.dpp_h5, paths.dpp_png)
+    if cfg[:compute_dpp] && !dpp_complete
+        try
+            run_dpp_product!(dpp_cfg, paths)
+            dpp_status = "ok"
+            dpp_note = "verified D_pp outputs"
+        catch error_instance
+            dpp_status = "error"
+            dpp_note = throwable_note(error_instance, catch_backtrace())
+            println("D_pp failed for energy ", energy_GeV, " GeV; continuing with other requested products.")
+            println(dpp_note)
+        end
     end
 
-    deleted = delete_cache_if_requested(paths.cache_h5, cfg)
+    all_requested_succeeded = product_success(dmumu_status) && product_success(dpp_status)
+    deleted = false
+    if all_requested_succeeded
+        deleted = delete_cache_if_requested(paths.cache_h5, cfg)
+    else
+        println("Keeping cache file ", paths.cache_h5, " because at least one requested product failed.")
+    end
+
+    overall_status = overall_product_status(dmumu_status, dpp_status)
+    overall_note = all_requested_succeeded ? "verified requested outputs" : "one or more requested products failed"
     return summary_row(
         energy_GeV,
-        "ok",
+        overall_status,
         deleted,
         paths.cache_h5,
         paths.combined_h5,
         paths.dpp_h5,
-        "verified requested outputs",
+        dmumu_status,
+        dpp_status,
+        dmumu_note,
+        dpp_note,
+        overall_note,
     )
 end
 
@@ -1347,8 +1450,13 @@ function run_campaign(cfg)
     summary_path = joinpath(cfg[:campaign_root], "campaign_summary.tsv")
     for energy_GeV in cfg[:energies]
         try
-            push!(summary_rows, run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV))
+            row = run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
+            push!(summary_rows, row)
             write_summary(summary_path, summary_rows)
+            if cfg[:stop_on_error] && row.status == "error"
+                println("Stopping campaign after requested product failure for energy ", energy_GeV, " GeV. See ", summary_path)
+                return summary_rows
+            end
         catch error_instance
             note = sprint(showerror, error_instance, catch_backtrace())
             paths = build_energy_paths(cfg, energy_GeV)
@@ -1359,6 +1467,10 @@ function run_campaign(cfg)
                 paths.cache_h5,
                 paths.combined_h5,
                 paths.dpp_h5,
+                cfg[:compute_dmumu] ? "error" : "disabled",
+                cfg[:compute_dpp] ? "error" : "disabled",
+                cfg[:compute_dmumu] ? note : "",
+                cfg[:compute_dpp] ? note : "",
                 note,
             ))
             write_summary(summary_path, summary_rows)
@@ -1369,7 +1481,7 @@ function run_campaign(cfg)
     end
 
     write_summary(summary_path, summary_rows)
-    if cfg[:compute_dpp]
+    if cfg[:compute_dpp] && any(row -> row.dpp_status in ("ok", "skipped_existing"), summary_rows)
         run_energy_distribution_plots(cfg[:campaign_root])
     end
     println()

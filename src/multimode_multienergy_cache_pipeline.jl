@@ -1010,8 +1010,26 @@ function append_cache_metadata!(path_h5::AbstractString, cache_mode::Symbol, cac
         file["cache_h5"] = string(cache_h5)
         file["cache_dataset"] = cache_mode == :mu ? "mu" : "positions,momenta"
         h5open(cache_h5, "r") do cache_file
-            for key in ("injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
-                haskey(cache_file, key) && (file[key] = read(cache_file[key]))
+            for key in (
+                "energy_GeV",
+                "dt_s",
+                "Omega0",
+                "B0_T",
+                "n_particles",
+                "trajectory_time_stride",
+                "boundary_mode",
+                "trajectory_output_precision",
+                "cache_output_precision",
+                "position_unit",
+                "momentum_unit",
+                "mu_unit",
+                "injection_mode",
+                "injection_mu0",
+                "injection_position_mode",
+                "injection_position",
+                "injection_position_unit",
+            )
+                haskey(cache_file, key) && !haskey(file, key) && (file[key] = read(cache_file[key]))
             end
         end
     end

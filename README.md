@@ -273,6 +273,11 @@ running. With `stop_on_error = true`, the campaign stops after both requested
 products for the current energy have been attempted and the summary row has
 been written.
 
+Both per-energy HDF5 products preserve the cache and physical metadata needed
+to interpret the result, including cache path/mode, energy, timestep,
+`Omega0`, `B0_T`, particle count, trajectory stride, boundary mode, units,
+output precision when present, and injection settings.
+
 When `compute_dpp = true`, each campaign folder also contains:
 
 - `energy_distribution_evolution_1e5.png`

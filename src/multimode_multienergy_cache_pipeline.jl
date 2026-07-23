@@ -46,7 +46,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :velocity_unit_in_m_per_s => 1e3,
         :box_length_pc => 200.0,
         :eta => 0.1,
+        :integration_steps_per_gyroperiod => nothing,
         :tOmega0_max => 5000.0,
+        :trajectory_duration_gyroperiods => nothing,
         :use_cfl => false,
         :cfl => 0.2,
         :seed => 42,
@@ -60,6 +62,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :injection_position => (0.5, 0.5, 0.5),
         :injection_position_unit => :box_fraction,
         :trajectory_time_stride => 1,
+        :trajectory_save_interval_gyroperiods => nothing,
         :trajectory_output_precision => Float32,
         :progress_every => 5000,
     ),
@@ -78,6 +81,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :particle_block_size => 128,
         :dmumu_start_mode => :sliding,
         :lag_mode => :uniform_samples,
+        :lag_min_gyroperiods => nothing,
+        :lag_max_gyroperiods => nothing,
+        :lag_stride_gyroperiods => nothing,
         :min_lag_steps => 1,
         :n_lag_samples => 40,
         :max_lag_steps => nothing,
@@ -99,6 +105,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :particle_seed => 20260423,
         :particle_block_size => 128,
         :lag_mode => :uniform_samples,
+        :lag_min_gyroperiods => nothing,
+        :lag_max_gyroperiods => nothing,
+        :lag_stride_gyroperiods => nothing,
         :min_lag_steps => 1,
         :n_lag_samples => 40,
         :max_lag_steps => nothing,
@@ -457,11 +466,14 @@ function verify_phase_space_cache_h5(path_h5::AbstractString)
         momenta = file["momenta"]
         t_s = read(file["t_s"])
         t_norm = read(file["t_norm"])
+        t_gyroperiods = haskey(file, "t_gyroperiods") ? read(file["t_gyroperiods"]) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
         alive_fraction = read(file["alive_fraction"])
         size(positions) == size(momenta) || error("Phase-space verification failed: positions/momenta shapes differ for " * path_h5)
         nsteps = size(positions, 3)
         length(t_s) == nsteps || error("Phase-space verification failed: t_s length mismatch for " * path_h5)
         length(t_norm) == nsteps || error("Phase-space verification failed: t_norm length mismatch for " * path_h5)
+        length(t_gyroperiods) == nsteps || error("Phase-space verification failed: t_gyroperiods length mismatch for " * path_h5)
+        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Phase-space cache time axes")
         length(alive_fraction) == nsteps || error("Phase-space verification failed: alive_fraction length mismatch for " * path_h5)
         nsteps > 1 || error("Phase-space verification failed: not enough saved steps in " * path_h5)
     end
@@ -474,10 +486,13 @@ function verify_mu_cache_h5(path_h5::AbstractString)
         mu = file["mu"]
         t_s = read(file["t_s"])
         t_norm = read(file["t_norm"])
+        t_gyroperiods = haskey(file, "t_gyroperiods") ? read(file["t_gyroperiods"]) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
         alive_fraction = read(file["alive_fraction"])
         nsteps = size(mu, 2)
         length(t_s) == nsteps || error("Mu-cache verification failed: t_s length mismatch for " * path_h5)
         length(t_norm) == nsteps || error("Mu-cache verification failed: t_norm length mismatch for " * path_h5)
+        length(t_gyroperiods) == nsteps || error("Mu-cache verification failed: t_gyroperiods length mismatch for " * path_h5)
+        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes")
         length(alive_fraction) == nsteps || error("Mu-cache verification failed: alive_fraction length mismatch for " * path_h5)
         size(mu, 1) > 0 || error("Mu-cache verification failed: zero particles in " * path_h5)
         nsteps > 1 || error("Mu-cache verification failed: not enough saved steps in " * path_h5)
@@ -560,6 +575,102 @@ function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractStr
     return true
 end
 
+function expected_time_resolution(cfg, fields, energy_GeV)
+    T = cfg[:precision]
+    Bx, By, Bz = fields[1], fields[2], fields[3]
+    nx, ny, nz = size(Bx)
+    x, y, z = RunnerMod.build_uniform_coords(cfg, nx, ny, nz, T)
+    B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
+    gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
+    Omega0 = RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P)
+    v0 = RunnerMod.energy_to_speed(energy_GeV, T)
+    trajectory_time = RunnerMod.resolve_trajectory_time_grid(cfg, Omega0, v0, RunnerMod.estimate_min_dx(x, y, z))
+    save_time = RunnerMod.resolve_save_stride(cfg, trajectory_time)
+    return trajectory_time, save_time, Float64(Omega0), Float64(B0)
+end
+
+function verify_cache_time_metadata(path_h5::AbstractString, cfg, fields, energy_GeV)
+    trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(cfg, fields, energy_GeV)
+    h5open(path_h5, "r") do file
+        t_s = Float64.(read(file["t_s"]))
+        t_norm = Float64.(read(file["t_norm"]))
+        t_gyroperiods = haskey(file, "t_gyroperiods") ? Float64.(read(file["t_gyroperiods"])) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
+        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Existing cache time axes")
+        stored_Omega0 = h5_scalar_float_or(file, "Omega0", nothing)
+        stored_B0 = h5_scalar_float_or(file, "B0_T", nothing)
+        stored_dt = h5_scalar_float_or(file, "dt_s", nothing)
+        stored_stride = h5_scalar_int_or(file, "trajectory_time_stride", save_time.trajectory_time_stride)
+        stored_Omega0 === nothing || isapprox(stored_Omega0, expected_Omega0; rtol=1.0e-10, atol=0.0) || error("Existing cache Omega0 does not match requested time reference; regenerate " * path_h5)
+        stored_B0 === nothing || isapprox(stored_B0, expected_B0; rtol=1.0e-10, atol=0.0) || error("Existing cache B0_T does not match requested time reference; regenerate " * path_h5)
+        stored_dt === nothing || isapprox(stored_dt, trajectory_time.dt_s; rtol=1.0e-10, atol=0.0) || error("Existing cache dt_s does not match requested integration resolution; regenerate " * path_h5)
+        stored_stride == save_time.trajectory_time_stride || error("Existing cache trajectory_time_stride does not match requested save interval; regenerate " * path_h5)
+        actual_duration_gp = Float64(t_gyroperiods[end] - t_gyroperiods[1])
+        isapprox(actual_duration_gp, trajectory_time.actual_trajectory_duration_gyroperiods; rtol=1.0e-10, atol=1.0e-12) || error("Existing cache duration does not match requested trajectory duration; regenerate " * path_h5)
+    end
+    return true
+end
+
+function read_cache_time_summary(path_h5::AbstractString)
+    h5open(path_h5, "r") do file
+        t_s = Float64.(read(file["t_s"]))
+        t_norm = Float64.(read(file["t_norm"]))
+        t_gyroperiods = haskey(file, "t_gyroperiods") ? Float64.(read(file["t_gyroperiods"])) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
+        return (
+            t_s = t_s,
+            t_norm = t_norm,
+            t_gyroperiods = t_gyroperiods,
+            Omega0 = h5_scalar_float_or(file, "Omega0", NaN),
+            B0_T = h5_scalar_float_or(file, "B0_T", NaN),
+            reference_gyroperiod_s = h5_scalar_float_or(file, "reference_gyroperiod_s", NaN),
+            B0_definition = h5_scalar_string_or(file, "time_reference_B0_definition", RunnerMod.TIME_REFERENCE_B0_DEFINITION),
+            requested_duration_gp = h5_scalar_float_or(file, "requested_trajectory_duration_gyroperiods", NaN),
+            actual_duration_gp = h5_scalar_float_or(file, "actual_trajectory_duration_gyroperiods", Float64(t_gyroperiods[end] - t_gyroperiods[1])),
+            requested_steps_per_gp = h5_scalar_float_or(file, "requested_integration_steps_per_gyroperiod", NaN),
+            actual_steps_per_gp = h5_scalar_float_or(file, "actual_integration_steps_per_gyroperiod", NaN),
+            timestep_limited_by = h5_scalar_string_or(file, "timestep_limited_by", "unknown"),
+            requested_save_gp = h5_scalar_float_or(file, "requested_trajectory_save_interval_gyroperiods", NaN),
+            actual_save_gp = h5_scalar_float_or(file, "actual_trajectory_save_interval_gyroperiods", NaN),
+        )
+    end
+end
+
+function lag_summary_for(cfg, t_gyroperiods)
+    lag_grid = CombinedFullMod.resolve_lag_grid(cfg, t_gyroperiods)
+    return (requested_min=first(lag_grid.requested_tau_gyroperiods), requested_max=last(lag_grid.requested_tau_gyroperiods), actual_min=first(lag_grid.tau_gyroperiods), actual_max=last(lag_grid.tau_gyroperiods), count=length(lag_grid.lag_steps))
+end
+
+function print_resolved_time_summary(cache_h5::AbstractString, dmumu_cfg, dpp_cfg)
+    summary = read_cache_time_summary(cache_h5)
+    println("Time reference:")
+    println("  Omega0                         = ", summary.Omega0, " s^-1")
+    println("  reference gyroperiod           = ", summary.reference_gyroperiod_s, " s")
+    println("  B0 definition                  = ", summary.B0_definition)
+    println("Trajectory:")
+    println("  requested duration             = ", summary.requested_duration_gp, " reference gyroperiods")
+    println("  actual duration                = ", summary.actual_duration_gp, " reference gyroperiods")
+    println("  requested integration res.     = ", summary.requested_steps_per_gp, " steps/reference gyroperiod")
+    println("  actual integration res.        = ", summary.actual_steps_per_gp, " steps/reference gyroperiod")
+    println("  timestep limiter               = ", summary.timestep_limited_by)
+    println("  requested save interval        = ", summary.requested_save_gp, " reference gyroperiods")
+    println("  actual save interval           = ", summary.actual_save_gp, " reference gyroperiods")
+    println("  saved samples                  = ", length(summary.t_gyroperiods))
+    if dmumu_cfg !== nothing
+        dmumu_lags = lag_summary_for(dmumu_cfg, summary.t_gyroperiods)
+        println("D_mumu lag grid:")
+        println("  requested range                = ", dmumu_lags.requested_min, " to ", dmumu_lags.requested_max, " reference gyroperiods")
+        println("  actual range                   = ", dmumu_lags.actual_min, " to ", dmumu_lags.actual_max, " reference gyroperiods")
+        println("  unique lag count               = ", dmumu_lags.count)
+    end
+    if dpp_cfg !== nothing
+        dpp_lags = lag_summary_for(dpp_cfg, summary.t_gyroperiods)
+        println("D_pp lag grid:")
+        println("  requested range                = ", dpp_lags.requested_min, " to ", dpp_lags.requested_max, " reference gyroperiods")
+        println("  actual range                   = ", dpp_lags.actual_min, " to ", dpp_lags.actual_max, " reference gyroperiods")
+        println("  unique lag count               = ", dpp_lags.count)
+    end
+    return nothing
+end
+
 function verify_dpp_outputs(path_h5::AbstractString, path_png::AbstractString)
     verify_file_nonempty(path_h5)
     verify_file_nonempty(path_png)
@@ -599,6 +710,19 @@ function h5_scalar_int_or(file, dataset_name::AbstractString, default::Integer)
     return parse(Int, string(value))
 end
 
+function h5_scalar_float_or(file, dataset_name::AbstractString, default)
+    value = h5_scalar_value_or(file, dataset_name, default)
+    value === nothing && return nothing
+    value isa Real && return Float64(value)
+    return parse(Float64, string(value))
+end
+
+function optional_float_matches(stored, requested; atol=1.0e-10, rtol=1.0e-10)
+    requested === nothing && return stored === nothing
+    stored === nothing && return false
+    return isapprox(Float64(stored), Float64(requested); atol=atol, rtol=rtol)
+end
+
 function h5_scalar_bool_or(file, dataset_name::AbstractString, default::Bool)
     value = h5_scalar_value_or(file, dataset_name, default)
     value isa Bool && return value
@@ -622,6 +746,9 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
         stored_lag_step_stride = h5_scalar_int_or(file, "lag_step_stride", 1)
         stored_max_lag_steps = h5_scalar_int_or(file, "max_lag_steps", -1)
+        stored_lag_min_gp = h5_scalar_float_or(file, "lag_min_gyroperiods", nothing)
+        stored_lag_max_gp = h5_scalar_float_or(file, "lag_max_gyroperiods", nothing)
+        stored_lag_stride_gp = h5_scalar_float_or(file, "lag_stride_gyroperiods", nothing)
         stored_n_mu_bins = h5_scalar_int_or(file, "n_mu_bins", Int(cfg[:n_mu_bins]))
         stored_mu_edges = read(file["dmumu"]["mu_edges"])
 
@@ -633,6 +760,9 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
                stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
                stored_max_lag_steps == requested_max_lag_steps &&
+               optional_float_matches(stored_lag_min_gp, get(cfg, :lag_min_gyroperiods, nothing)) &&
+               optional_float_matches(stored_lag_max_gp, get(cfg, :lag_max_gyroperiods, nothing)) &&
+               optional_float_matches(stored_lag_stride_gp, get(cfg, :lag_stride_gyroperiods, nothing)) &&
                stored_n_mu_bins == Int(cfg[:n_mu_bins]) &&
                length(stored_mu_edges) == Int(cfg[:n_mu_bins]) + 1 &&
                isapprox(first(stored_mu_edges), Float64(cfg[:mu_min]); atol=0.0, rtol=0.0) &&
@@ -649,12 +779,18 @@ function dpp_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
         stored_lag_step_stride = h5_scalar_int_or(file, "lag_step_stride", 1)
         stored_max_lag_steps = h5_scalar_int_or(file, "max_lag_steps", -1)
+        stored_lag_min_gp = h5_scalar_float_or(file, "lag_min_gyroperiods", nothing)
+        stored_lag_max_gp = h5_scalar_float_or(file, "lag_max_gyroperiods", nothing)
+        stored_lag_stride_gp = h5_scalar_float_or(file, "lag_stride_gyroperiods", nothing)
         requested_max_lag_steps = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
         return stored_lag_mode == cfg[:lag_mode] &&
                stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
                stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
-               stored_max_lag_steps == requested_max_lag_steps
+               stored_max_lag_steps == requested_max_lag_steps &&
+               optional_float_matches(stored_lag_min_gp, get(cfg, :lag_min_gyroperiods, nothing)) &&
+               optional_float_matches(stored_lag_max_gp, get(cfg, :lag_max_gyroperiods, nothing)) &&
+               optional_float_matches(stored_lag_stride_gp, get(cfg, :lag_stride_gyroperiods, nothing))
     end
 end
 
@@ -783,17 +919,16 @@ function write_mu_cache_step!(writer, save_idx::Integer, mu_step)
     return nothing
 end
 
-function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, alive_fraction_save, dt, Omega0, B0)
+function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, Omega0, B0)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
+    file["t_gyroperiods"] = Float64.(t_gyroperiods_save)
     file["alive_fraction"] = Float64.(alive_fraction_save)
     file["energy_GeV"] = Float64[energy_GeV]
-    file["dt_s"] = Float64[dt]
-    file["Omega0"] = Float64[Omega0]
-    file["B0_T"] = Float64[B0]
     file["n_particles"] = Int[cfg[:n_particles]]
-    file["trajectory_time_stride"] = Int[cfg[:trajectory_time_stride]]
+    RunnerMod.write_time_reference_metadata!(file, Omega0, B0)
+    RunnerMod.write_trajectory_time_metadata!(file, trajectory_time, save_time)
     file["boundary_mode"] = string(cfg[:boundary])
     file["cache_mode"] = "mu"
     file["cache_output_precision"] = string(writer.outtype)
@@ -842,23 +977,21 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     end
     periodic_boundary = boundary == :periodic
 
-    trajectory_stride = Int(cfg[:trajectory_time_stride])
     cache_out_type = cfg[:mu_cache_output_precision]
 
-    B0 = mean(sqrt.(Bx .^ 2 .+ By .^ 2 .+ Bz .^ 2))
+    B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
     gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
-    Omega0 = T(RunnerMod.Q_E) * B0 / (gamma0 * T(RunnerMod.M_P))
+    Omega0 = T(RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P))
     v0 = RunnerMod.energy_to_speed(energy_GeV, T)
-    dt_gyro = T(cfg[:eta]) / Omega0
-    dt = dt_gyro
-    if cfg[:use_cfl]
-        dt = min(dt, T(cfg[:cfl]) * RunnerMod.estimate_min_dx(x, y, z) / v0)
-    end
+    trajectory_time = RunnerMod.resolve_trajectory_time_grid(cfg, Omega0, v0, RunnerMod.estimate_min_dx(x, y, z))
+    save_time = RunnerMod.resolve_save_stride(cfg, trajectory_time)
+    trajectory_stride = save_time.trajectory_time_stride
 
-    t_end = T(cfg[:tOmega0_max]) / Omega0
-    nsteps = Int(floor(t_end / dt)) + 1
+    dt = T(trajectory_time.dt_s)
+    nsteps = trajectory_time.n_integration_steps
     t_s = dt .* collect(T, 0:(nsteps - 1))
     t_norm = t_s .* Omega0
+    t_gyroperiods = t_norm ./ T(2 * pi)
     save_indices = RunnerMod.sampled_step_indices(nsteps, trajectory_stride)
     nsave = length(save_indices)
 
@@ -902,6 +1035,14 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     println("  cache mode     = mu")
     println("  save stride    = ", trajectory_stride)
     println("  save steps     = ", nsave, "/", nsteps)
+    println("  duration [Tg0] = ", trajectory_time.actual_trajectory_duration_gyroperiods)
+    println("  dt [Tg0]       = ", trajectory_time.dt_gyroperiods)
+    if trajectory_time.timestep_limited_by == "cfl"
+        println("  CFL reduced timestep; actual steps/reference gyroperiod = ", trajectory_time.actual_integration_steps_per_gyroperiod)
+    end
+    if save_time.save_interval_source == :gyroperiods && abs(save_time.actual_trajectory_save_interval_gyroperiods - save_time.requested_trajectory_save_interval_gyroperiods) > 1.0e-6 * max(1.0, abs(save_time.requested_trajectory_save_interval_gyroperiods))
+        @warn "Requested trajectory save interval was rounded to an integer integration-step stride." requested_gyroperiods=save_time.requested_trajectory_save_interval_gyroperiods actual_gyroperiods=save_time.actual_trajectory_save_interval_gyroperiods trajectory_time_stride=trajectory_stride
+    end
     println("  output type    = ", cache_out_type)
     println("  est. size [GiB]= ", mu_cache_gib)
 
@@ -952,8 +1093,10 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
             energy_GeV,
             t_norm[save_indices],
             t_s[save_indices],
+            t_gyroperiods[save_indices],
             alive_fraction[save_indices],
-            dt,
+            trajectory_time,
+            save_time,
             Omega0,
             B0,
         )
@@ -973,6 +1116,8 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
         elapsed = elapsed,
         Omega0 = Float64(Omega0),
         dt = Float64(dt),
+        trajectory_time = trajectory_time,
+        save_time = save_time,
     )
 end
 
@@ -1013,8 +1158,23 @@ function append_cache_metadata!(path_h5::AbstractString, cache_mode::Symbol, cac
             for key in (
                 "energy_GeV",
                 "dt_s",
+                "dt_tOmega0",
+                "dt_gyroperiods",
                 "Omega0",
                 "B0_T",
+                "reference_gyroperiod_s",
+                "time_reference_name",
+                "time_reference_B0_definition",
+                "time_reference_energy_definition",
+                "requested_trajectory_duration_gyroperiods",
+                "actual_trajectory_duration_gyroperiods",
+                "actual_trajectory_duration_tOmega0",
+                "actual_trajectory_duration_s",
+                "requested_integration_steps_per_gyroperiod",
+                "actual_integration_steps_per_gyroperiod",
+                "timestep_limited_by",
+                "requested_trajectory_save_interval_gyroperiods",
+                "actual_trajectory_save_interval_gyroperiods",
                 "n_particles",
                 "trajectory_time_stride",
                 "boundary_mode",
@@ -1054,7 +1214,9 @@ function run_combined_from_mu_cache(cfg)
         mu_dataset = cache_file["mu"]
         t_s = Float64.(read(cache_file["t_s"]))
         t_norm = Float64.(read(cache_file["t_norm"]))
+        t_gyroperiods = haskey(cache_file, "t_gyroperiods") ? Float64.(read(cache_file["t_gyroperiods"])) : CombinedFullMod.t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = size(mu_dataset, 2)
+        CombinedFullMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes")
         total_particles = size(mu_dataset, 1)
 
         particle_indices = CombinedFullMod.build_particle_indices(total_particles, cfg)
@@ -1063,9 +1225,11 @@ function run_combined_from_mu_cache(cfg)
         selected_particle_count = length(particle_indices)
         selected_particle_count > 0 || error("No particles selected.")
 
-        lag_steps = CombinedFullMod.build_selected_lag_steps(nsteps, cfg)
+        lag_grid = CombinedFullMod.resolve_lag_grid(cfg, t_gyroperiods)
+        lag_steps = lag_grid.lag_steps
         tau_s = [Float64(t_s[lag_step + 1] - t_s[1]) for lag_step in lag_steps]
-        tau_norm = [Float64(t_norm[lag_step + 1] - t_norm[1]) for lag_step in lag_steps]
+        tau_norm = Float64.(lag_grid.tau_norm)
+        tau_gyroperiods = Float64.(lag_grid.tau_gyroperiods)
         estimated_pair_visits = CombinedFullMod.guard_exact_pair_cost!(nsteps, selected_particle_count, lag_steps, cfg)
 
         n_lags = length(lag_steps)
@@ -1172,7 +1336,8 @@ function run_combined_from_mu_cache(cfg)
             collapsed_raw_norm,
             collapsed_centered_norm,
             collapsed_raw_norm_count_weighted,
-            collapsed_centered_norm_count_weighted,
+            collapsed_centered_norm_count_weighted;
+            lag_grid=lag_grid,
         )
         append_cache_metadata!(cfg[:output_h5], :mu, cfg[:cache_h5])
         println("Saved combined HDF5 to ", cfg[:output_h5])
@@ -1183,7 +1348,7 @@ function run_combined_from_mu_cache(cfg)
         CombinedFullMod.plot_dmumu_heatmap_full(
             cfg[:output_heatmap_png],
             mu_edges,
-            tau_norm,
+            tau_gyroperiods,
             dmumu_centered_norm;
             use_usetex=cfg[:use_usetex],
             mu_axis_label=mu_axis_label,
@@ -1266,6 +1431,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     if !compute_analysis && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
+        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
         println("Cache already verified; transport analysis disabled for energy ", energy_GeV, " GeV")
         return summary_row(
             energy_GeV,
@@ -1296,6 +1462,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         if isfile(paths.cache_h5)
             verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
             verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
+            verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
             deleted = delete_cache_if_requested(paths.cache_h5, cfg)
         end
         println("Requested outputs already verified; skipping energy ", energy_GeV, " GeV")
@@ -1318,6 +1485,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         println("Reusing existing cache file ", paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
+        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
     else
         if cfg[:cache_mode] == :phase_space
             runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(
@@ -1337,6 +1505,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     if !compute_analysis
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
+        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
         println("Transport analysis disabled; keeping verified cache file ", paths.cache_h5)
         return summary_row(
             energy_GeV,
@@ -1378,6 +1547,12 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
             :output_h5 => paths.dpp_h5,
             :output_dpp_png => paths.dpp_png,
         ),
+    )
+
+    print_resolved_time_summary(
+        paths.cache_h5,
+        cfg[:compute_dmumu] ? dmumu_cfg : nothing,
+        cfg[:compute_dpp] ? dpp_cfg : nothing,
     )
 
     if cfg[:compute_dmumu] && !dmumu_complete
@@ -1684,6 +1859,22 @@ function config_maybe_particle_count(value, key_name::AbstractString)
     return config_int(value, key_name)
 end
 
+function warn_legacy_config_keys(keys, replacement::AbstractString)
+    isempty(keys) && return nothing
+    @warn "Legacy time configuration key(s) are still supported but deprecated; use $(replacement)." keys=join(keys, ", ")
+    return nothing
+end
+
+function reject_duplicate_time_controls(section, old_keys, new_keys, section_name::AbstractString, replacement::AbstractString)
+    used_old = [key for key in old_keys if haskey(section, key)]
+    used_new = [key for key in new_keys if haskey(section, key)]
+    if !isempty(used_old) && !isempty(used_new)
+        error(section_name * " cannot mix legacy key(s) " * join(used_old, ", ") * " with preferred key(s) " * join(used_new, ", ") * ". Use " * replacement * ".")
+    end
+    warn_legacy_config_keys(used_old, replacement)
+    return nothing
+end
+
 function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
     key == :injection_position && return config_tuple3_floats(value, key_name)
@@ -1695,6 +1886,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key == :mu_bin_abs && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
+    key in (:trajectory_duration_gyroperiods, :trajectory_save_interval_gyroperiods, :integration_steps_per_gyroperiod, :lag_min_gyroperiods, :lag_max_gyroperiods, :lag_stride_gyroperiods) && return config_float(value, key_name)
     key == :use_usetex && return config_bool(value, key_name)
     return value
 end
@@ -1779,6 +1971,7 @@ end
 function apply_dmumu_section!(cfg, section)
     allowed_keys = union(Set(string(key) for key in keys(cfg[:dmumu_overrides])), Set(["particles"]))
     validate_toml_keys(section, allowed_keys, "[dmumu]")
+    reject_duplicate_time_controls(section, ["min_lag_steps", "max_lag_steps", "lag_step_stride"], ["lag_min_gyroperiods", "lag_max_gyroperiods", "lag_stride_gyroperiods"], "[dmumu]", "lag_min_gyroperiods/lag_max_gyroperiods/lag_stride_gyroperiods")
 
     override_section = Dict{String, Any}(String(key) => value for (key, value) in section if String(key) != "particles")
     apply_override_section!(cfg[:dmumu_overrides], override_section, "[dmumu]")
@@ -1790,6 +1983,7 @@ end
 function apply_dpp_section!(cfg, section)
     allowed_keys = Set(string(key) for key in keys(cfg[:dpp_overrides]))
     validate_toml_keys(section, allowed_keys, "[dpp]")
+    reject_duplicate_time_controls(section, ["min_lag_steps", "max_lag_steps", "lag_step_stride"], ["lag_min_gyroperiods", "lag_max_gyroperiods", "lag_stride_gyroperiods"], "[dpp]", "lag_min_gyroperiods/lag_max_gyroperiods/lag_stride_gyroperiods")
     apply_override_section!(cfg[:dpp_overrides], section, "[dpp]")
     return nothing
 end
@@ -1852,8 +2046,16 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     haskey(run, "mu_cache_output_precision") && (cfg[:mu_cache_output_precision] = config_precision(run["mu_cache_output_precision"], "[run].mu_cache_output_precision"))
     haskey(run, "smoke") && (cfg[:smoke] = config_bool(run["smoke"], "[run].smoke"))
 
-    apply_override_section!(cfg[:trajectory_overrides], toml_section(config, "trajectory"), "[trajectory]")
-    apply_override_section!(cfg[:trajectory_overrides], toml_section(config, "particles"), "[particles]")
+    trajectory_section = toml_section(config, "trajectory")
+    particles_section = toml_section(config, "particles")
+    reject_duplicate_time_controls(trajectory_section, ["tOmega0_max"], ["trajectory_duration_gyroperiods"], "[trajectory]", "trajectory_duration_gyroperiods")
+    reject_duplicate_time_controls(trajectory_section, ["eta"], ["integration_steps_per_gyroperiod"], "[trajectory]", "integration_steps_per_gyroperiod")
+    reject_duplicate_time_controls(trajectory_section, ["trajectory_time_stride"], ["trajectory_save_interval_gyroperiods"], "[trajectory]", "trajectory_save_interval_gyroperiods")
+    reject_duplicate_time_controls(particles_section, ["tOmega0_max"], ["trajectory_duration_gyroperiods"], "[particles]", "trajectory_duration_gyroperiods")
+    reject_duplicate_time_controls(particles_section, ["eta"], ["integration_steps_per_gyroperiod"], "[particles]", "integration_steps_per_gyroperiod")
+    reject_duplicate_time_controls(particles_section, ["trajectory_time_stride"], ["trajectory_save_interval_gyroperiods"], "[particles]", "trajectory_save_interval_gyroperiods")
+    apply_override_section!(cfg[:trajectory_overrides], trajectory_section, "[trajectory]")
+    apply_override_section!(cfg[:trajectory_overrides], particles_section, "[particles]")
     apply_dmumu_section!(cfg, toml_section(config, "dmumu"))
     apply_dpp_section!(cfg, toml_section(config, "dpp"))
     return absolute_config_path
@@ -1980,7 +2182,9 @@ function runtime_config()
             :n_particles => 64,
             :precision => Float32,
             :field_subset => (16, 16, 16),
+            :trajectory_duration_gyroperiods => nothing,
             :tOmega0_max => 20.0,
+            :trajectory_save_interval_gyroperiods => nothing,
             :trajectory_time_stride => 1,
             :progress_every => 20,
         ))
@@ -1991,6 +2195,9 @@ function runtime_config()
             :n_particles_to_use => 64,
             :particle_selection => :range,
             :dmumu_start_mode => :sliding,
+            :lag_min_gyroperiods => nothing,
+            :lag_max_gyroperiods => nothing,
+            :lag_stride_gyroperiods => nothing,
             :min_lag_steps => 1,
             :n_lag_samples => 8,
             :max_lag_steps => 20,
@@ -2002,6 +2209,9 @@ function runtime_config()
             :first_particle => 1,
             :n_particles_to_use => 64,
             :particle_selection => :range,
+            :lag_min_gyroperiods => nothing,
+            :lag_max_gyroperiods => nothing,
+            :lag_stride_gyroperiods => nothing,
             :min_lag_steps => 1,
             :n_lag_samples => 8,
             :max_lag_steps => 20,
@@ -2027,8 +2237,20 @@ function runtime_config()
             cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energy")
         elseif startswith(argument, "--energies=")
             cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energies")
+        elseif startswith(argument, "--trajectory-duration-gyroperiods=")
+            cfg[:trajectory_overrides][:trajectory_duration_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--integration-steps-per-gyroperiod=")
+            cfg[:trajectory_overrides][:integration_steps_per_gyroperiod] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--trajectory-save-interval-gyroperiods=")
+            cfg[:trajectory_overrides][:trajectory_save_interval_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-start-mode=")
             cfg[:dmumu_overrides][:dmumu_start_mode] = CombinedFullMod.parse_dmumu_start_mode(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-lag-min-gyroperiods=")
+            cfg[:dmumu_overrides][:lag_min_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-lag-max-gyroperiods=")
+            cfg[:dmumu_overrides][:lag_max_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-lag-stride-gyroperiods=")
+            cfg[:dmumu_overrides][:lag_stride_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-min-lag-steps=")
             cfg[:dmumu_overrides][:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-lag-mode=")
@@ -2063,6 +2285,12 @@ function runtime_config()
             cfg[:dmumu_overrides][:mu_min] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-mu-max=")
             cfg[:dmumu_overrides][:mu_max] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-lag-min-gyroperiods=")
+            cfg[:dpp_overrides][:lag_min_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-lag-max-gyroperiods=")
+            cfg[:dpp_overrides][:lag_max_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-lag-stride-gyroperiods=")
+            cfg[:dpp_overrides][:lag_stride_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-min-lag-steps=")
             cfg[:dpp_overrides][:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-lag-mode=")

@@ -3,6 +3,9 @@ haskey(ENV, "MPLCONFIGDIR") || (ENV["MPLCONFIGDIR"] = "/tmp/mpl")
 using HDF5
 using PyPlot
 using Random
+using Statistics
+
+include(joinpath(@__DIR__, "time_units.jl"))
 
 const PIPELINE_ROOT = dirname(@__DIR__)
 const C_LIGHT = 2.99792458e8
@@ -20,6 +23,9 @@ const DPP_FULL_CFG = Dict{Symbol, Any}(
     :particle_seed => 20260423,
     :particle_block_size => 128,
     :lag_mode => :uniform_samples,
+    :lag_min_gyroperiods => nothing,
+    :lag_max_gyroperiods => nothing,
+    :lag_stride_gyroperiods => nothing,
     :min_lag_steps => 1,
     :n_lag_samples => 40,
     :max_lag_steps => nothing,
@@ -66,7 +72,7 @@ function parse_cli_config(args)
     cfg = Dict{Symbol, Any}(DPP_FULL_CFG)
     for argument in args
         if argument == "--help" || argument == "-h"
-            println("Usage: julia src/compute_dpp_full.jl --trajectory-h5=PATH --output-dir=DIR [D_pp controls]")
+            println("Usage: julia src/compute_dpp_full.jl --trajectory-h5=PATH --output-dir=DIR [--lag-min-gyroperiods=A --lag-max-gyroperiods=B --n-lag-samples=N | legacy step controls]")
             exit(0)
         elseif startswith(argument, "--trajectory-h5=")
             cfg[:trajectory_h5] = split(argument, "=", limit=2)[2]
@@ -94,12 +100,18 @@ function parse_cli_config(args)
             cfg[:lag_mode] = parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--min-lag-steps=")
             cfg[:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-min-gyroperiods=") || startswith(argument, "--dpp-lag-min-gyroperiods=")
+            cfg[:lag_min_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-lag-samples=")
             cfg[:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--max-lag-steps=")
             cfg[:max_lag_steps] = parse_maybe_int(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-max-gyroperiods=") || startswith(argument, "--dpp-lag-max-gyroperiods=")
+            cfg[:lag_max_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-step-stride=")
             cfg[:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-stride-gyroperiods=") || startswith(argument, "--dpp-lag-stride-gyroperiods=")
+            cfg[:lag_stride_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-energy-snapshots=")
             cfg[:n_energy_snapshots] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--use-usetex=")
@@ -308,14 +320,14 @@ end
 function copy_cache_metadata!(file, cache_h5)
     cache_h5 === nothing && return nothing
     h5open(cache_h5, "r") do cache_file
-        for key in ("energy_GeV", "dt_s", "Omega0", "B0_T", "n_particles", "trajectory_time_stride", "boundary_mode", "cache_mode", "momentum_unit", "injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
+        for key in ("energy_GeV", "dt_s", "dt_tOmega0", "dt_gyroperiods", "Omega0", "B0_T", "reference_gyroperiod_s", "time_reference_name", "time_reference_B0_definition", "time_reference_energy_definition", "requested_trajectory_duration_gyroperiods", "actual_trajectory_duration_gyroperiods", "actual_trajectory_duration_tOmega0", "actual_trajectory_duration_s", "requested_integration_steps_per_gyroperiod", "actual_integration_steps_per_gyroperiod", "timestep_limited_by", "requested_trajectory_save_interval_gyroperiods", "actual_trajectory_save_interval_gyroperiods", "n_particles", "trajectory_time_stride", "boundary_mode", "cache_mode", "momentum_unit", "injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
             haskey(cache_file, key) && !haskey(file, key) && (file[key] = read(cache_file[key]))
         end
     end
     return nothing
 end
 
-function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_norm, first_particle, last_particle, particle_indices, dpp_results, energy_snapshot_results)
+function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_norm, first_particle, last_particle, particle_indices, dpp_results, energy_snapshot_results; lag_grid=nothing)
     mkpath(dirname(path_h5))
     h5open(path_h5, "w") do file
         file["trajectory_h5"] = string(cfg[:trajectory_h5])
@@ -332,6 +344,9 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         file["lag_mode"] = string(cfg[:lag_mode])
         file["n_lag_samples"] = length(lag_steps)
         file["requested_n_lag_samples"] = Int(cfg[:n_lag_samples])
+        haskey(cfg, :lag_min_gyroperiods) && cfg[:lag_min_gyroperiods] !== nothing && (file["lag_min_gyroperiods"] = Float64[cfg[:lag_min_gyroperiods]])
+        haskey(cfg, :lag_max_gyroperiods) && cfg[:lag_max_gyroperiods] !== nothing && (file["lag_max_gyroperiods"] = Float64[cfg[:lag_max_gyroperiods]])
+        haskey(cfg, :lag_stride_gyroperiods) && cfg[:lag_stride_gyroperiods] !== nothing && (file["lag_stride_gyroperiods"] = Float64[cfg[:lag_stride_gyroperiods]])
         file["min_lag_steps"] = Int(get(cfg, :min_lag_steps, 1))
         file["lag_step_stride"] = Int(cfg[:lag_step_stride])
         file["max_lag_steps"] = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
@@ -339,6 +354,18 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         copy_cache_metadata!(file, get(cfg, :cache_h5, cfg[:trajectory_h5]))
         dpp_group = create_group(file, "dpp")
         dpp_group["lag_step"] = lag_steps
+        dpp_group["lag_steps"] = lag_steps
+        if lag_grid !== nothing
+            dpp_group["requested_tau_gyroperiods"] = lag_grid.requested_tau_gyroperiods
+            dpp_group["tau_gyroperiods"] = lag_grid.tau_gyroperiods
+            dpp_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
+            file["lag_mapping_max_error_gyroperiods"] = Float64[lag_grid.max_lag_mapping_error_gyroperiods]
+            file["lag_grid_source"] = string(lag_grid.lag_source)
+        else
+            dpp_group["requested_tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)
+            dpp_group["tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)
+            dpp_group["lag_mapping_error_gyroperiods"] = zeros(Float64, length(lag_steps))
+        end
         dpp_group["tau_s"] = tau_s
         dpp_group["tau_norm"] = tau_norm
         dpp_group["p0_kg_m_per_s"] = Float64[dpp_results.p0]
@@ -359,19 +386,20 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         energy_group["snapshot_step_index"] = energy_snapshot_results.indices
         energy_group["snapshot_t_s"] = energy_snapshot_results.t_s
         energy_group["snapshot_t_norm"] = energy_snapshot_results.t_norm
+        energy_group["snapshot_t_gyroperiods"] = energy_snapshot_results.t_gyroperiods
         energy_group["energy_GeV"] = energy_snapshot_results.energy_gev
         energy_group["particle_indices"] = particle_indices
     end
     return nothing
 end
 
-function plot_dpp_tau_curve(path_png::AbstractString, tau_norm, dpp_raw_norm, dpp_centered_norm; use_usetex::Bool=false)
+function plot_dpp_tau_curve(path_png::AbstractString, tau_gyroperiods, dpp_raw_norm, dpp_centered_norm; use_usetex::Bool=false)
     mkpath(dirname(path_png))
     PyPlot.rc("text", usetex=use_usetex)
     figure(figsize=(7, 4))
-    plot(tau_norm, dpp_centered_norm, "o-", color="black", linewidth=1.5, markersize=4, label="centered")
-    plot(tau_norm, dpp_raw_norm, "s--", color="tab:blue", linewidth=1.2, markersize=3, label="raw")
-    xlabel(raw"$\tau\Omega_0$")
+    plot(tau_gyroperiods, dpp_centered_norm, "o-", color="black", linewidth=1.5, markersize=4, label="centered")
+    plot(tau_gyroperiods, dpp_raw_norm, "s--", color="tab:blue", linewidth=1.2, markersize=3, label="raw")
+    xlabel("Lag [reference gyroperiods]")
     ylabel(raw"$D_{pp}/(p_0^2\Omega_0)$")
     title(raw"Global $D_{pp}(\tau)$")
     grid(true, alpha=0.3)
@@ -391,16 +419,20 @@ function run_dpp_full(cfg)
         momenta_dataset = trajectory_file["momenta"]
         t_s = Float64.(read(trajectory_file["t_s"]))
         t_norm = Float64.(read(trajectory_file["t_norm"]))
+        t_gyroperiods = haskey(trajectory_file, "t_gyroperiods") ? Float64.(read(trajectory_file["t_gyroperiods"])) : t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = validate_phase_space_layout(momenta_dataset, t_s, t_norm)
+        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="D_pp trajectory time axes")
         total_particles = size(momenta_dataset, 1)
         particle_indices = build_particle_indices(total_particles, cfg)
         first_particle = first(particle_indices)
         last_particle = last(particle_indices)
         selected_particle_count = length(particle_indices)
         selected_particle_count > 0 || error("No particles selected.")
-        lag_steps = build_selected_lag_steps(nsteps, cfg)
+        lag_grid = resolve_lag_grid(cfg, t_gyroperiods)
+        lag_steps = lag_grid.lag_steps
         tau_s = [Float64(t_s[lag_step + 1] - t_s[1]) for lag_step in lag_steps]
-        tau_norm = [Float64(t_norm[lag_step + 1] - t_norm[1]) for lag_step in lag_steps]
+        tau_norm = Float64.(lag_grid.tau_norm)
+        tau_gyroperiods = Float64.(lag_grid.tau_gyroperiods)
         n_lags = length(lag_steps)
         p0 = momentum_magnitude(momenta_dataset[particle_indices[1], 1, 1], momenta_dataset[particle_indices[1], 2, 1], momenta_dataset[particle_indices[1], 3, 1])
         isfinite(p0) && p0 > 0.0 || error("Cannot compute D_pp normalization: first selected particle has invalid initial momentum.")
@@ -451,11 +483,12 @@ function run_dpp_full(cfg)
             indices = snapshot_indices,
             t_s = Float64.(t_s[snapshot_indices]),
             t_norm = Float64.(t_norm[snapshot_indices]),
+            t_gyroperiods = Float64.(t_gyroperiods[snapshot_indices]),
             energy_gev = energy_snapshots,
         )
-        save_dpp_full_h5(cfg[:output_h5], cfg, lag_steps, tau_s, tau_norm, first_particle, last_particle, particle_indices, dpp_results, energy_snapshot_results)
+        save_dpp_full_h5(cfg[:output_h5], cfg, lag_steps, tau_s, tau_norm, first_particle, last_particle, particle_indices, dpp_results, energy_snapshot_results; lag_grid=lag_grid)
         println("Saved D_pp HDF5 to ", cfg[:output_h5])
-        plot_dpp_tau_curve(cfg[:output_dpp_png], tau_norm, dpp_raw_norm, dpp_centered_norm; use_usetex=cfg[:use_usetex])
+        plot_dpp_tau_curve(cfg[:output_dpp_png], tau_gyroperiods, dpp_raw_norm, dpp_centered_norm; use_usetex=cfg[:use_usetex])
         println("Saved D_pp tau curve to ", cfg[:output_dpp_png])
     end
     return nothing

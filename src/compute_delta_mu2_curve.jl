@@ -5,6 +5,8 @@ using DataFrames
 using PyPlot
 using Statistics
 
+include(joinpath(@__DIR__, "time_units.jl"))
+
 const UGAUSS_TO_T = 1e-10
 const PC_TO_M = 3.085677581e16
 const PIPELINE_ROOT = dirname(@__DIR__)
@@ -407,6 +409,7 @@ end
 function build_output_dataframe(lag_steps, t_s, t_norm, particle_counts, particle_means, particle_m2s, pair_sum_squares, pair_counts)
     tau_s = [t_s[lag + 1] - t_s[1] for lag in lag_steps]
     tau_norm = [t_norm[lag + 1] - t_norm[1] for lag in lag_steps]
+    tau_gyroperiods = tOmega0_to_gyroperiods.(tau_norm)
     particle_std = [count <= 1 ? NaN : sqrt(particle_m2s[index] / (count - 1)) for (index, count) in enumerate(particle_counts)]
     particle_sem = [sem_from_stats(particle_counts[index], particle_m2s[index]) for index in eachindex(particle_counts)]
     pair_mean = [pair_counts[index] == 0 ? NaN : pair_sum_squares[index] / pair_counts[index] for index in eachindex(pair_counts)]
@@ -415,6 +418,7 @@ function build_output_dataframe(lag_steps, t_s, t_norm, particle_counts, particl
         lag_step = lag_steps,
         tau_s = tau_s,
         tau_norm = tau_norm,
+        tau_gyroperiods = tau_gyroperiods,
         delta_mu2_particle_mean = particle_means,
         delta_mu2_particle_std = particle_std,
         delta_mu2_particle_sem = particle_sem,
@@ -446,12 +450,13 @@ end
 function plot_delta_mu2(df::DataFrame, path_png::AbstractString; use_usetex::Bool=false)
     PyPlot.rc("text", usetex=use_usetex)
     figure(figsize=(7, 4))
-    errorbar_stride = max(1, length(df.tau_norm) ÷ 25)
-    errorbar_indices = collect(1:errorbar_stride:length(df.tau_norm))
+    tau_gyroperiods = hasproperty(df, :tau_gyroperiods) ? df.tau_gyroperiods : tOmega0_to_gyroperiods.(df.tau_norm)
+    errorbar_stride = max(1, length(tau_gyroperiods) ÷ 25)
+    errorbar_indices = collect(1:errorbar_stride:length(tau_gyroperiods))
     std_lower = df.delta_mu2_particle_mean .- df.delta_mu2_particle_std
     std_upper = df.delta_mu2_particle_mean .+ df.delta_mu2_particle_std
     fill_between(
-        df.tau_norm,
+        tau_gyroperiods,
         std_lower,
         std_upper,
         color="0.65",
@@ -461,7 +466,7 @@ function plot_delta_mu2(df::DataFrame, path_png::AbstractString; use_usetex::Boo
         label=raw"$\pm 1\sigma$ particle spread",
     )
     plot(
-        df.tau_norm,
+        tau_gyroperiods,
         df.delta_mu2_particle_mean,
         color="black",
         linewidth=1.6,
@@ -469,7 +474,7 @@ function plot_delta_mu2(df::DataFrame, path_png::AbstractString; use_usetex::Boo
         label="particle mean",
     )
     errorbar(
-        df.tau_norm[errorbar_indices],
+        tau_gyroperiods[errorbar_indices],
         df.delta_mu2_particle_mean[errorbar_indices],
         yerr=df.delta_mu2_particle_sem[errorbar_indices],
         fmt="none",
@@ -480,7 +485,7 @@ function plot_delta_mu2(df::DataFrame, path_png::AbstractString; use_usetex::Boo
         zorder=3,
         label="SEM of mean (sparse)",
     )
-    xlabel(raw"$\tau\Omega_0$")
+    xlabel("Lag [reference gyroperiods]")
     ylabel(raw"$\langle (\Delta\mu)^2 \rangle$")
     grid(true, alpha=0.3)
     legend(frameon=false, loc="best")

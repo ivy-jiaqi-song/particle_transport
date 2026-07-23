@@ -59,17 +59,17 @@ def load_from_cache_phase_space(base_total: str, energy_dir: str):
         return None
     with h5py.File(path, "r") as handle:
         momenta = handle["momenta"][:]
-        t_s = handle["t_s"][:]
+        t_axis = handle["t_gyroperiods"][:] if "t_gyroperiods" in handle else handle["t_s"][:]
     if momenta.ndim != 3 or momenta.shape[1] != 3:
         raise ValueError(f"Unsupported momenta layout in {path}: expected a 3D array with vector axis 1")
-    if momenta.shape[0] == len(t_s):
+    if momenta.shape[0] == len(t_axis):
         p_mag = np.linalg.norm(momenta, axis=1)
-    elif momenta.shape[2] == len(t_s):
+    elif momenta.shape[2] == len(t_axis):
         p_mag = np.linalg.norm(momenta, axis=1).T
     else:
-        raise ValueError(f"Could not align momenta snapshots with t_s in {path}: shape={momenta.shape}, len(t_s)={len(t_s)}")
+        raise ValueError(f"Could not align momenta snapshots with time axis in {path}: shape={momenta.shape}, len={len(t_axis)}")
     energy_gev = p_mag * C_M_S / J_PER_GEV
-    return energy_gev, t_s, f"cache/phase_space_{energy_dir}.h5 (momenta, kg*m/s -> GeV)"
+    return energy_gev, t_axis, f"cache/phase_space_{energy_dir}.h5 (momenta, kg*m/s -> GeV)"
 
 
 def load_from_dpp_energy_snapshots(base_total: str, energy_dir: str):
@@ -78,8 +78,8 @@ def load_from_dpp_energy_snapshots(base_total: str, energy_dir: str):
         return None
     with h5py.File(path, "r") as handle:
         energy_gev = handle["energy_snapshots/energy_GeV"][:]
-        t_s = handle["energy_snapshots/snapshot_t_s"][:]
-    return energy_gev.T, t_s, f"{energy_dir}/dpp_full.h5 (energy_GeV, already GeV)"
+        t_axis = handle["energy_snapshots/snapshot_t_gyroperiods"][:] if "energy_snapshots/snapshot_t_gyroperiods" in handle else handle["energy_snapshots/snapshot_t_s"][:]
+    return energy_gev.T, t_axis, f"{energy_dir}/dpp_full.h5 (energy_GeV, already GeV)"
 
 
 LOADERS = [
@@ -129,14 +129,14 @@ def make_bins(values: np.ndarray, nbins: int = 200, pad_frac: float = 0.10):
     return np.linspace(lower, upper, nbins + 1), (upper - lower) / nbins
 
 
-def plot_evolution(energy_gev: np.ndarray, t_s: np.ndarray, tag: str, outpath: str, title_suffix: str = ""):
+def plot_evolution(energy_gev: np.ndarray, t_axis: np.ndarray, tag: str, outpath: str, title_suffix: str = ""):
     snapshots = pick_snapshots(energy_gev.shape[0])
     bins, width = make_bins(energy_gev)
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for index in snapshots:
         counts, _ = np.histogram(energy_gev[index], bins=bins)
-        ax.stairs(np.clip(counts, 1, None), bins, label=f"t={t_s[index]:.2e} s (#{index})")
+        ax.stairs(np.clip(counts, 1, None), bins, label=f"t/Tg0={t_axis[index]:.3g} (#{index})")
     ax.set_yscale("log")
     ax.set_xlabel("Energy [GeV]")
     ax.set_ylabel(f"counts per {width * 1000:.2f} MeV bin")
@@ -154,7 +154,7 @@ def plot_comparison(results: dict, outpath: str, title_suffix: str = ""):
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 
     ax = axes[0]
-    for tag, (energy_gev, _t_s, _source) in results.items():
+    for tag, (energy_gev, _t_axis, _source) in results.items():
         initial_energy = float(energy_gev[0].mean())
         relative_energy = (energy_gev - initial_energy) / initial_energy
         bins, _ = make_bins(relative_energy)
@@ -175,7 +175,7 @@ def plot_comparison(results: dict, outpath: str, title_suffix: str = ""):
     ax.legend(title="injection E", loc="best")
 
     ax = axes[1]
-    for tag, (energy_gev, t_s, _source) in results.items():
+    for tag, (energy_gev, t_axis, _source) in results.items():
         initial_energy = float(energy_gev[0].mean())
         relative_energy = (energy_gev - initial_energy) / initial_energy
         index = relative_energy.shape[0] - 1
@@ -185,7 +185,7 @@ def plot_comparison(results: dict, outpath: str, title_suffix: str = ""):
             np.clip(counts, 1, None),
             bins,
             color=COLORS.get(tag, "gray"),
-            label=f"{tag} GeV (t={t_s[index]:.2e} s)",
+            label=f"{tag} GeV (t/Tg0={t_axis[index]:.3g})",
             linewidth=1.5,
         )
     ax.set_yscale("log")
@@ -211,7 +211,7 @@ def run_folder(campaign_folder: str, energy_tags=None):
     rows = []
     for energy_dir, tag, nominal_energy in energies:
         try:
-            energy_gev, t_s, source = load_energy(base_total, energy_dir)
+            energy_gev, t_axis, source = load_energy(base_total, energy_dir)
         except FileNotFoundError as error:
             print(f"  {tag}: SKIP ({error})")
             continue
@@ -226,14 +226,14 @@ def run_folder(campaign_folder: str, energy_tags=None):
         unchanged = int(np.sum(final == initial))
 
         outpath = os.path.join(base_total, f"energy_distribution_evolution_{tag}.png")
-        plot_evolution(energy_gev, t_s, tag, outpath, title_suffix=f"- {folder_name} ")
+        plot_evolution(energy_gev, t_axis, tag, outpath, title_suffix=f"- {folder_name} ")
         print(
             f"  {tag}: N={particle_count} nT={snapshot_count} span={energy_max - energy_min:.4f} GeV  "
             f"acc={accelerated} dec={decelerated} un={unchanged}  src={source.split('/')[-1]}"
         )
         print(f"        -> {outpath}")
 
-        results[tag] = (energy_gev, t_s, source)
+        results[tag] = (energy_gev, t_axis, source)
         rows.append(
             dict(
                 folder=folder_name,

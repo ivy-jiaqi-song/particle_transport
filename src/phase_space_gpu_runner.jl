@@ -3,6 +3,8 @@ using CUDA
 using Random
 using Statistics
 
+include(joinpath(@__DIR__, "time_units.jl"))
+
 const C_LIGHT = 2.99792458e8
 const Q_E = 1.602176634e-19
 const M_P = 1.67262192369e-27
@@ -21,7 +23,9 @@ const CFG = Dict{Symbol, Any}(
     :velocity_unit_in_m_per_s => KMPS_TO_MPS,
     :box_length_pc => 200.0,
     :eta => 0.1,
+    :integration_steps_per_gyroperiod => nothing,
     :tOmega0_max => 5000.0,
+    :trajectory_duration_gyroperiods => nothing,
     :use_cfl => false,
     :cfl => 0.2,
     :seed => 42,
@@ -36,6 +40,7 @@ const CFG = Dict{Symbol, Any}(
     :injection_position => (0.5, 0.5, 0.5),
     :injection_position_unit => :box_fraction,
     :trajectory_time_stride => 1,
+    :trajectory_save_interval_gyroperiods => nothing,
     :trajectory_output_precision => Float32,
     :progress_every => 5000,
     :output_dir => DEFAULT_OUTPUT_DIR,
@@ -417,17 +422,16 @@ function write_phase_space_step!(writer, save_idx::Integer, x1_step, x2_step, x3
     writer.momenta[:, 3, save_idx] = Tout.(p3_step)
 end
 
-function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, alive_fraction_save, dt, Omega0, B0)
+function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, Omega0, B0)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
+    file["t_gyroperiods"] = Float64.(t_gyroperiods_save)
     file["alive_fraction"] = Float64.(alive_fraction_save)
     file["energy_GeV"] = Float64[energy_GeV]
-    file["dt_s"] = Float64[dt]
-    file["Omega0"] = Float64[Omega0]
-    file["B0_T"] = Float64[B0]
     file["n_particles"] = Int[cfg[:n_particles]]
-    file["trajectory_time_stride"] = Int[cfg[:trajectory_time_stride]]
+    write_time_reference_metadata!(file, Omega0, B0)
+    write_trajectory_time_metadata!(file, trajectory_time, save_time)
     file["boundary_mode"] = string(cfg[:boundary])
     file["trajectory_output_precision"] = string(writer.outtype)
     file["position_unit"] = "m"
@@ -454,23 +458,21 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
     end
     periodic_boundary = boundary == :periodic
 
-    trajectory_stride = Int(cfg[:trajectory_time_stride])
     trajectory_out_type = cfg[:trajectory_output_precision]
 
-    B0 = mean(sqrt.(Bx .^ 2 .+ By .^ 2 .+ Bz .^ 2))
+    B0 = reference_B0_T(Bx, By, Bz)
     gamma0 = energy_to_gamma(energy_GeV, T)
-    Omega0 = T(Q_E) * B0 / (gamma0 * T(M_P))
+    Omega0 = T(reference_Omega0(B0, gamma0, Q_E, M_P))
     v0 = energy_to_speed(energy_GeV, T)
-    dt_gyro = T(cfg[:eta]) / Omega0
-    dt = dt_gyro
-    if cfg[:use_cfl]
-        dt = min(dt, T(cfg[:cfl]) * estimate_min_dx(x, y, z) / v0)
-    end
+    trajectory_time = resolve_trajectory_time_grid(cfg, Omega0, v0, estimate_min_dx(x, y, z))
+    save_time = resolve_save_stride(cfg, trajectory_time)
+    trajectory_stride = save_time.trajectory_time_stride
 
-    t_end = T(cfg[:tOmega0_max]) / Omega0
-    nsteps = Int(floor(t_end / dt)) + 1
+    dt = T(trajectory_time.dt_s)
+    nsteps = trajectory_time.n_integration_steps
     t_s = dt .* collect(T, 0:(nsteps - 1))
     t_norm = t_s .* Omega0
+    t_gyroperiods = t_norm ./ T(2 * pi)
     save_indices = sampled_step_indices(nsteps, trajectory_stride)
     nsave = length(save_indices)
 
@@ -513,6 +515,14 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
     println("  phase-space H5 = enabled")
     println("  save stride    = ", trajectory_stride)
     println("  save steps     = ", nsave, "/", nsteps)
+    println("  duration [Tg0] = ", trajectory_time.actual_trajectory_duration_gyroperiods)
+    println("  dt [Tg0]       = ", trajectory_time.dt_gyroperiods)
+    if trajectory_time.timestep_limited_by == "cfl"
+        println("  CFL reduced timestep; actual steps/reference gyroperiod = ", trajectory_time.actual_integration_steps_per_gyroperiod)
+    end
+    if save_time.save_interval_source == :gyroperiods && abs(save_time.actual_trajectory_save_interval_gyroperiods - save_time.requested_trajectory_save_interval_gyroperiods) > 1.0e-6 * max(1.0, abs(save_time.requested_trajectory_save_interval_gyroperiods))
+        @warn "Requested trajectory save interval was rounded to an integer integration-step stride." requested_gyroperiods=save_time.requested_trajectory_save_interval_gyroperiods actual_gyroperiods=save_time.actual_trajectory_save_interval_gyroperiods trajectory_time_stride=trajectory_stride
+    end
     println("  output type    = ", trajectory_out_type)
     println("  est. size [GiB]= ", phase_space_gib)
 
@@ -561,8 +571,10 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
             energy_GeV,
             t_norm[save_indices],
             t_s[save_indices],
+            t_gyroperiods[save_indices],
             alive_fraction[save_indices],
-            dt,
+            trajectory_time,
+            save_time,
             Omega0,
             B0,
         )
@@ -579,6 +591,7 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
     return (
         t_norm = Float64.(t_norm),
         t_s = Float64.(t_s),
+        t_gyroperiods = Float64.(t_gyroperiods),
         alive_fraction = alive_fraction,
         nsave = nsave,
         phase_space_path = output_paths(cfg, energy_GeV).h5,
@@ -586,6 +599,8 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
         elapsed = elapsed,
         Omega0 = Float64(Omega0),
         dt = Float64(dt),
+        trajectory_time = trajectory_time,
+        save_time = save_time,
         B0 = Float64(B0),
     )
 end

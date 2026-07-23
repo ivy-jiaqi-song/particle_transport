@@ -369,7 +369,7 @@ def load_product(ref: ProductRef, dmumu_variant: str) -> Product:
 
         return Product(
             ref=ref,
-            tau_norm=read_array(delta_group, "tau_norm"),
+            tau_norm=read_array(delta_group, "tau_gyroperiods") if "tau_gyroperiods" in delta_group else read_array(delta_group, "tau_norm") / (2.0 * np.pi),
             delta_mu2_mean=mean,
             delta_mu2_sem=sem,
             mu_edges=read_array(dmumu_group, "mu_edges"),
@@ -440,7 +440,7 @@ def plot_product_group(
 
     axes[0].set_xscale("log")
     set_scale(axes[0], "y", delta_y_scale)
-    axes[0].set_xlabel(r"$\tau \Omega_0$")
+    axes[0].set_xlabel("Lag [reference gyroperiods]")
     axes[0].set_ylabel(r"$\langle(\Delta\mu)^2\rangle$")
     axes[0].set_title(r"$\langle(\Delta\mu)^2\rangle$")
     axes[0].grid(True, which="both", alpha=0.28)

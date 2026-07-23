@@ -22,6 +22,9 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :particle_block_size => 128,
     :dmumu_start_mode => :sliding,
     :lag_mode => :uniform_samples,
+    :lag_min_gyroperiods => nothing,
+    :lag_max_gyroperiods => nothing,
+    :lag_stride_gyroperiods => nothing,
     :min_lag_steps => 1,
     :n_lag_samples => 40,
     :max_lag_steps => nothing,
@@ -68,10 +71,13 @@ function print_usage()
       --particle-chunk-size=N
       --dmumu-start-mode=sliding|injection
       --min-lag-steps=N
+      --lag-min-gyroperiods=VALUE
       --n-lag-samples=N
       --max-lag-steps=N|none
+      --lag-max-gyroperiods=VALUE
       --lag-mode=uniform|stride
       --lag-step-stride=N
+      --lag-stride-gyroperiods=VALUE
       --n-mu-bins=N
       --mu-bin-abs
       --no-mu-bin-abs
@@ -205,14 +211,20 @@ function parse_cli_config(args)
             cfg[:dmumu_start_mode] = parse_dmumu_start_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--min-lag-steps=")
             cfg[:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-min-gyroperiods=") || startswith(argument, "--dmumu-lag-min-gyroperiods=")
+            cfg[:lag_min_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-lag-samples=")
             cfg[:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--max-lag-steps=")
             cfg[:max_lag_steps] = parse_maybe_int(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-max-gyroperiods=") || startswith(argument, "--dmumu-lag-max-gyroperiods=")
+            cfg[:lag_max_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-mode=")
             cfg[:lag_mode] = parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-step-stride=")
             cfg[:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-stride-gyroperiods=") || startswith(argument, "--dmumu-lag-stride-gyroperiods=")
+            cfg[:lag_stride_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--n-mu-bins=")
             cfg[:n_mu_bins] = parse(Int, split(argument, "=", limit=2)[2])
         elseif argument == "--mu-bin-abs"
@@ -794,7 +806,8 @@ function save_combined_full_h5(
     collapsed_raw_norm,
     collapsed_centered_norm,
     collapsed_raw_norm_count_weighted,
-    collapsed_centered_norm_count_weighted,
+    collapsed_centered_norm_count_weighted
+    ; lag_grid=nothing,
 )
     mkpath(dirname(path_h5))
     h5open(path_h5, "w") do file
@@ -814,6 +827,9 @@ function save_combined_full_h5(
         file["lag_mode"] = string(cfg[:lag_mode])
         file["n_lag_samples"] = length(lag_steps)
         file["requested_n_lag_samples"] = Int(cfg[:n_lag_samples])
+        haskey(cfg, :lag_min_gyroperiods) && cfg[:lag_min_gyroperiods] !== nothing && (file["lag_min_gyroperiods"] = Float64[cfg[:lag_min_gyroperiods]])
+        haskey(cfg, :lag_max_gyroperiods) && cfg[:lag_max_gyroperiods] !== nothing && (file["lag_max_gyroperiods"] = Float64[cfg[:lag_max_gyroperiods]])
+        haskey(cfg, :lag_stride_gyroperiods) && cfg[:lag_stride_gyroperiods] !== nothing && (file["lag_stride_gyroperiods"] = Float64[cfg[:lag_stride_gyroperiods]])
         file["min_lag_steps"] = Int(get(cfg, :min_lag_steps, 1))
         file["lag_step_stride"] = Int(cfg[:lag_step_stride])
         file["max_lag_steps"] = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
@@ -841,11 +857,27 @@ function save_combined_full_h5(
             for column_name in names(delta_df)
                 delta_group[string(column_name)] = collect(delta_df[!, column_name])
             end
+            if lag_grid !== nothing
+                delta_group["requested_tau_gyroperiods"] = lag_grid.requested_tau_gyroperiods
+                delta_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
+            end
 
             dmumu_group = create_group(file, "dmumu")
             dmumu_group["mu_edges"] = mu_edges
             dmumu_group["mu_centers"] = mu_centers
             dmumu_group["lag_step"] = lag_steps
+            dmumu_group["lag_steps"] = lag_steps
+            if lag_grid !== nothing
+                dmumu_group["requested_tau_gyroperiods"] = lag_grid.requested_tau_gyroperiods
+                dmumu_group["tau_gyroperiods"] = lag_grid.tau_gyroperiods
+                dmumu_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
+                file["lag_mapping_max_error_gyroperiods"] = Float64[lag_grid.max_lag_mapping_error_gyroperiods]
+                file["lag_grid_source"] = string(lag_grid.lag_source)
+            else
+                dmumu_group["requested_tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)
+                dmumu_group["tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)
+                dmumu_group["lag_mapping_error_gyroperiods"] = zeros(Float64, length(lag_steps))
+            end
             dmumu_group["tau_s"] = tau_s
             dmumu_group["tau_norm"] = tau_norm
             dmumu_group["count_pairs_full"] = dmumu_counts
@@ -872,7 +904,7 @@ end
 function plot_dmumu_heatmap_full(
     path_png::AbstractString,
     mu_edges,
-    tau_norm,
+    tau_gyroperiods,
     dmumu_centered_norm;
     use_usetex::Bool=false,
     mu_axis_label::AbstractString=raw"$\mu_0$",
@@ -885,11 +917,11 @@ function plot_dmumu_heatmap_full(
         dmumu_centered_norm,
         aspect="auto",
         origin="lower",
-        extent=(minimum(tau_norm), maximum(tau_norm), mu_edges[1], mu_edges[end]),
+        extent=(minimum(tau_gyroperiods), maximum(tau_gyroperiods), mu_edges[1], mu_edges[end]),
         cmap="viridis",
     )
     colorbar(label=raw"$D_{\mu\mu}/\Omega_0$ (centered)")
-    xlabel(raw"$\tau\Omega_0$")
+    xlabel("Lag [reference gyroperiods]")
     ylabel(mu_axis_label)
     title(title_label)
     tight_layout()
@@ -986,7 +1018,9 @@ function run_combined_full(cfg)
         momenta_dataset = trajectory_file["momenta"]
         t_s = Float64.(read(trajectory_file["t_s"]))
         t_norm = Float64.(read(trajectory_file["t_norm"]))
+        t_gyroperiods = haskey(trajectory_file, "t_gyroperiods") ? Float64.(read(trajectory_file["t_gyroperiods"])) : t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = validate_trajectory_layout(positions_dataset, momenta_dataset, t_s, t_norm)
+        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Trajectory HDF5 time axes")
         total_particles = size(positions_dataset, 1)
 
         particle_indices = build_particle_indices(total_particles, cfg)
@@ -995,9 +1029,11 @@ function run_combined_full(cfg)
         selected_particle_count = length(particle_indices)
         selected_particle_count > 0 || error("No particles selected.")
 
-        lag_steps = build_selected_lag_steps(nsteps, cfg)
+        lag_grid = resolve_lag_grid(cfg, t_gyroperiods)
+        lag_steps = lag_grid.lag_steps
         tau_s = [Float64(t_s[lag_step + 1] - t_s[1]) for lag_step in lag_steps]
-        tau_norm = [Float64(t_norm[lag_step + 1] - t_norm[1]) for lag_step in lag_steps]
+        tau_norm = Float64.(lag_grid.tau_norm)
+        tau_gyroperiods = Float64.(lag_grid.tau_gyroperiods)
         estimated_pair_visits = guard_exact_pair_cost!(nsteps, selected_particle_count, lag_steps, cfg)
 
         n_lags = length(lag_steps)
@@ -1132,7 +1168,8 @@ function run_combined_full(cfg)
             collapsed_raw_norm,
             collapsed_centered_norm,
             collapsed_raw_norm_count_weighted,
-            collapsed_centered_norm_count_weighted,
+            collapsed_centered_norm_count_weighted;
+            lag_grid=lag_grid,
         )
         println("Saved combined HDF5 to ", cfg[:output_h5])
 
@@ -1143,7 +1180,7 @@ function run_combined_full(cfg)
             plot_dmumu_heatmap_full(
                 cfg[:output_heatmap_png],
                 mu_edges,
-                tau_norm,
+                tau_gyroperiods,
                 dmumu_centered_norm;
                 use_usetex=cfg[:use_usetex],
                 mu_axis_label=mu_axis_label,

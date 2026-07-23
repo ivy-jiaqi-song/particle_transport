@@ -68,8 +68,10 @@ B_paths = ["i_mag_field", "j_mag_field", "k_mag_field"]
 v_paths = ["i_velocity", "j_velocity", "k_velocity"]
 velocity_unit_in_m_per_s = 1000.0
 box_length_pc = 200.0
-eta = 0.1
-tOmega0_max = 5000.0
+# Preferred time controls use reference gyroperiods, T_g0 = 2π / Omega0.
+# These values preserve the historical defaults eta = 0.1 and tOmega0_max = 5000.
+integration_steps_per_gyroperiod = 62.83185307179586
+trajectory_duration_gyroperiods = 795.7747154594767
 use_cfl = false
 cfl = 0.2
 boundary = "periodic"
@@ -88,7 +90,7 @@ seed = 42
 n_particles = 100000
 precision = "Float64"
 field_subset = []
-trajectory_time_stride = 1
+trajectory_save_interval_gyroperiods = 0.015915494309189534
 trajectory_output_precision = "Float32"
 progress_every = 5000
 
@@ -119,14 +121,16 @@ particle_selection = "block-random"
 particle_seed = 20260423
 particle_block_size = 128
 
-# Lag grid controls for both D_mumu estimator modes.
-# uniform-samples: use n_lag_samples rounded lags from min_lag_steps through max_lag_steps.
-# stride: use min_lag_steps, min_lag_steps + lag_step_stride, ... through max_lag_steps.
+# Lag grid controls for both D_mumu estimator modes, in reference gyroperiods.
+# uniform-samples: use n_lag_samples linearly spaced requested lags from
+# lag_min_gyroperiods through lag_max_gyroperiods, then map to cached offsets.
+# If lag_max_gyroperiods is omitted, the full cached duration is used.
+# stride: use lag_min_gyroperiods, lag_min_gyroperiods + lag_stride_gyroperiods, ...
 lag_mode = "uniform-samples"
-min_lag_steps = 1
+lag_min_gyroperiods = 0.015915494309189534
 n_lag_samples = 40
-max_lag_steps = "none"
-lag_step_stride = 1
+lag_max_gyroperiods = 795.7747154594767
+lag_stride_gyroperiods = 0.015915494309189534
 
 # D_mumu mu-binning and safety controls. mu_bin_abs bins by abs(mu_start)
 # while stored mu values and Delta mu remain signed.
@@ -150,8 +154,8 @@ particle_selection = "block-random"
 particle_seed = 20260423
 particle_block_size = 128
 lag_mode = "uniform-samples"
-min_lag_steps = 1
+lag_min_gyroperiods = 0.015915494309189534
 n_lag_samples = 40
-max_lag_steps = "none"
-lag_step_stride = 1
+lag_max_gyroperiods = 795.7747154594767
+lag_stride_gyroperiods = 0.015915494309189534
 n_energy_snapshots = 5

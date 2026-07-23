@@ -88,7 +88,8 @@ The current public config layout is:
 
 - `[particles]`
   - Physical trajectory settings: field dataset names, velocity unit, box size,
-    eta, integration time, boundary behavior.
+    reference-gyroperiod duration, integration resolution, cache cadence, and
+    boundary behavior.
   - Injection controls: `injection_position_mode = "random"` keeps the existing
     random-in-box start positions; `"fixed"` uses `injection_position`. With
     `injection_position_unit = "box-fraction"`, `[0.5, 0.5, 0.5]` is the box
@@ -98,7 +99,7 @@ The current public config layout is:
     particle with the requested pitch-angle cosine relative to the local
     magnetic field while keeping gyrophase random.
   - Particle and cache burden settings: particle count, precision, field subset,
-    saved time stride, output precision.
+    output precision.
 
 - `[dmumu]`
   - D_mumu-only transport-analysis settings.
@@ -121,6 +122,51 @@ The current public config layout is:
 
 Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
 but new configs should use the generic `[input]` form.
+
+## Time Conventions
+
+User-facing trajectory and lag controls are expressed in reference gyroperiods.
+The fixed reference is computed once per energy from the loaded field arrays:
+
+```text
+B0_T = mean(sqrt(Bx^2 + By^2 + Bz^2)) after conversion to tesla
+Omega0 = q_e * B0_T / (gamma0 * m_p)
+T_g0 = 2π / Omega0
+N_g = t / T_g0 = t Omega0 / (2π)
+```
+
+Here "reference" means this fixed campaign convention, not the instantaneous
+local gyroperiod along a particle orbit. The integration timestep is still stored
+and used internally in seconds. Cache axes store seconds (`t_s`), angular
+normalized time (`t_norm = t_s Omega0`), and reference gyroperiods
+(`t_gyroperiods = t_norm / 2π`). Transport loops still use integer cached-step
+lag offsets, resolved from requested reference-gyroperiod lag grids.
+
+Preferred time controls:
+
+| Quantity | Preferred control |
+| --- | --- |
+| Trajectory duration | `[particles].trajectory_duration_gyroperiods` |
+| Gyro-limited integration resolution | `[particles].integration_steps_per_gyroperiod` |
+| Cache sampling interval | `[particles].trajectory_save_interval_gyroperiods` |
+| D_mumu lag grid | `[dmumu].lag_min_gyroperiods`, `lag_max_gyroperiods`, `lag_stride_gyroperiods` |
+| D_pp lag grid | `[dpp].lag_min_gyroperiods`, `lag_max_gyroperiods`, `lag_stride_gyroperiods` |
+
+Legacy migration table:
+
+| Legacy control | Preferred replacement |
+| --- | --- |
+| `tOmega0_max` | `trajectory_duration_gyroperiods = tOmega0_max / (2π)` |
+| `eta` | `integration_steps_per_gyroperiod = 2π / eta` |
+| `trajectory_time_stride` | `trajectory_save_interval_gyroperiods` |
+| `min_lag_steps` | `lag_min_gyroperiods` |
+| `max_lag_steps` | `lag_max_gyroperiods` |
+| `lag_step_stride` | `lag_stride_gyroperiods` |
+
+Step-stride lag and cache-cadence mappings depend on the resolved integration
+and saved-cache cadence, so the code reports requested and actual values rather
+than requiring users to calculate them manually. Mixing old and new keys for the
+same quantity is rejected.
 
 ## Campaign Examples
 
@@ -216,6 +262,9 @@ Useful runtime flags:
 - `--modes=alfven,fast` or `--mode=alfven`
 - `--campaign=mp/0_5/alfven`
 - `--energy=1e5` or `--energies=1e5,1e6,1e7`
+- `--trajectory-duration-gyroperiods=VALUE`
+- `--integration-steps-per-gyroperiod=VALUE`
+- `--trajectory-save-interval-gyroperiods=VALUE`
 - `--dmumu-start-mode=injection` for injection-anchored D_mumu bins using
   `Delta mu = mu(tau) - mu(0)` and binning by injected `mu(0)`.
 - `--dmumu-mu-bin-abs` or `[dmumu].mu_bin_abs = true` to bin by `abs(mu_start)`.
@@ -223,8 +272,14 @@ Useful runtime flags:
 - `--dmumu-n-mu-bins=N --dmumu-mu-min=0 --dmumu-mu-max=1` to control the D_mumu bin axis.
 - `--dmumu-lag-mode=stride --dmumu-min-lag-steps=MIN --dmumu-lag-step-stride=STRIDE` to use
   D_mumu lag steps `MIN, MIN+STRIDE, MIN+2*STRIDE, ...` through the maximum lag.
+- `--dmumu-lag-min-gyroperiods=VALUE --dmumu-lag-max-gyroperiods=VALUE` to request
+  the D_mumu lag range in reference gyroperiods.
+- `--dmumu-lag-stride-gyroperiods=VALUE` when `--dmumu-lag-mode=stride`.
 - `--dpp-lag-mode=stride --dpp-min-lag-steps=MIN --dpp-lag-step-stride=STRIDE` to control
   the independent D_pp lag grid.
+- `--dpp-lag-min-gyroperiods=VALUE --dpp-lag-max-gyroperiods=VALUE` to request
+  the D_pp lag range in reference gyroperiods.
+- `--dpp-lag-stride-gyroperiods=VALUE` when `--dpp-lag-mode=stride`.
 - `--dmumu-n-particles=N` and `--dpp-n-particles=N` to choose independent
   estimator particle subsets from the same generated cache.
 - `--cache-mode=mu` or `--cache-mode=phase-space`

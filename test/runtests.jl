@@ -64,7 +64,7 @@ end
     t_gp = collect(0.0:0.25:5.0)
     cfg = Dict{Symbol, Any}(
         :lag_mode => :uniform_samples,
-        :lag_min_gyroperiods => 0.2,
+        :lag_min_gyroperiods => 0.25,
         :lag_max_gyroperiods => 1.1,
         :lag_stride_gyroperiods => nothing,
         :min_lag_steps => 1,
@@ -87,6 +87,25 @@ end
     stride_grid = resolve_lag_grid(stride_cfg, t_gp)
     @test stride_grid.lag_steps == [1, 2, 3, 4]
     @test stride_grid.tau_gyroperiods ≈ [0.25, 0.5, 0.75, 1.0]
+
+    too_small = copy(cfg)
+    too_small[:lag_min_gyroperiods] = 0.01
+    too_small[:lag_max_gyroperiods] = 0.5
+    @test_throws ErrorException resolve_lag_grid(too_small, t_gp)
+
+    too_large = copy(cfg)
+    too_large[:lag_min_gyroperiods] = 0.5
+    too_large[:lag_max_gyroperiods] = 8.0
+    @test_throws ErrorException resolve_lag_grid(too_large, t_gp)
+
+    duplicate_cfg = copy(cfg)
+    duplicate_cfg[:lag_min_gyroperiods] = 0.26
+    duplicate_cfg[:lag_max_gyroperiods] = 0.49
+    duplicate_cfg[:n_lag_samples] = 4
+    duplicate_grid = resolve_lag_grid(duplicate_cfg, t_gp; min_unique_lags=1)
+    @test duplicate_grid.requested_lag_count == 4
+    @test duplicate_grid.unique_lag_count < duplicate_grid.requested_lag_count
+    @test duplicate_grid.duplicate_lag_mapping_count > 0
 end
 
 @testset "time axes" begin
@@ -95,5 +114,20 @@ end
     t_norm = t_s .* Omega0
     t_gp = t_gyroperiods_from_axes(t_s, t_norm)
     @test validate_time_axes(t_s, t_norm, t_gp) == 3
+    @test validate_time_axes(t_s, t_norm, t_gp; require_uniform=true) == 3
     @test_throws ErrorException validate_time_axes([0.0, 0.5, 0.4], t_norm, t_gp)
+    @test_throws ErrorException validate_time_axes([0.0, 0.5, 1.2], [0.0, 2.0, 4.8], [0.0, 2.0 / (2pi), 4.8 / (2pi)]; require_uniform=true)
+end
+
+@testset "shared reference metadata" begin
+    Bx_total = fill(3.0, 2, 2, 2)
+    By_total = fill(4.0, 2, 2, 2)
+    Bz_total = fill(0.0, 2, 2, 2)
+    @test reference_B0_T(Bx_total, By_total, Bz_total) ≈ 5.0
+    ref = campaign_time_reference(5.0, 2.0; source_mode="total", source_path="total.h5", source_identity="total.h5", field_subset=(2, 2, 2))
+    @test ref.B0_reference_T ≈ 5.0
+    @test ref.Omega0_reference_s_inv ≈ 2.0
+    @test ref.time_reference_source_mode == "total"
+    @test ref.time_reference_source_path == "total.h5"
+    @test ref.reference_gyroperiod_s ≈ pi
 end

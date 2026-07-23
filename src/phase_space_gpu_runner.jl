@@ -390,11 +390,7 @@ end
 
 function sampled_step_indices(nsteps::Integer, stride::Integer)
     stride < 1 && error("trajectory_time_stride must be >= 1")
-    idx = collect(1:stride:nsteps)
-    if isempty(idx) || idx[end] != nsteps
-        push!(idx, nsteps)
-    end
-    return idx
+    return collect(1:stride:nsteps)
 end
 
 function estimate_phase_space_bytes(n_particles::Integer, nsave::Integer, ::Type{T}) where {T}
@@ -422,7 +418,7 @@ function write_phase_space_step!(writer, save_idx::Integer, x1_step, x2_step, x3
     writer.momenta[:, 3, save_idx] = Tout.(p3_step)
 end
 
-function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, Omega0, B0)
+function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, time_reference)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
@@ -430,8 +426,15 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     file["alive_fraction"] = Float64.(alive_fraction_save)
     file["energy_GeV"] = Float64[energy_GeV]
     file["n_particles"] = Int[cfg[:n_particles]]
-    write_time_reference_metadata!(file, Omega0, B0)
+    write_time_reference_metadata!(file, time_reference)
     write_trajectory_time_metadata!(file, trajectory_time, save_time)
+    file["analysis_cache_duration_gyroperiods"] = Float64[t_gyroperiods_save[end] - t_gyroperiods_save[1]]
+    file["integration_step_count"] = Int[trajectory_time.n_integration_steps]
+    file["analysis_sample_count"] = Int[length(t_gyroperiods_save)]
+    file["exact_final_state_stored"] = false
+    file["trajectory_mode"] = string(get(cfg, :trajectory_mode, "unknown"))
+    file["trajectory_field_source_path"] = string(get(cfg, :trajectory_field_source_path, cfg[:file]))
+    file["trajectory_field_source_identity"] = string(get(cfg, :trajectory_field_source_identity, get(cfg, :trajectory_field_source_path, cfg[:file])))
     file["boundary_mode"] = string(cfg[:boundary])
     file["trajectory_output_precision"] = string(writer.outtype)
     file["position_unit"] = "m"
@@ -446,7 +449,7 @@ function output_paths(cfg, E)
     return (h5 = joinpath(outdir, "phase_space_" * tag * ".h5"), label = "E = " * string(Int(E)) * " GeV")
 end
 
-function run_gpu_ensemble(cfg, fields; energy_GeV)
+function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference=nothing)
     T = cfg[:precision]
     Bx, By, Bz, vx, vy, vz = fields
     nx, ny, nz = size(Bx)
@@ -460,9 +463,13 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
 
     trajectory_out_type = cfg[:trajectory_output_precision]
 
-    B0 = reference_B0_T(Bx, By, Bz)
     gamma0 = energy_to_gamma(energy_GeV, T)
-    Omega0 = T(reference_Omega0(B0, gamma0, Q_E, M_P))
+    if time_reference === nothing
+        B0 = reference_B0_T(Bx, By, Bz)
+        Omega0_value = reference_Omega0(B0, gamma0, Q_E, M_P)
+        time_reference = campaign_time_reference(B0, Omega0_value; source_mode="trajectory", source_path=String(cfg[:file]), source_identity=String(cfg[:file]), field_subset=get(cfg, :field_subset, nothing))
+    end
+    Omega0 = T(time_reference.Omega0_reference_s_inv)
     v0 = energy_to_speed(energy_GeV, T)
     trajectory_time = resolve_trajectory_time_grid(cfg, Omega0, v0, estimate_min_dx(x, y, z))
     save_time = resolve_save_stride(cfg, trajectory_time)
@@ -575,8 +582,7 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
             alive_fraction[save_indices],
             trajectory_time,
             save_time,
-            Omega0,
-            B0,
+            time_reference,
         )
     catch
         if writer !== nothing
@@ -601,7 +607,8 @@ function run_gpu_ensemble(cfg, fields; energy_GeV)
         dt = Float64(dt),
         trajectory_time = trajectory_time,
         save_time = save_time,
-        B0 = Float64(B0),
+        B0 = Float64(time_reference.B0_reference_T),
+        time_reference = time_reference,
     )
 end
 

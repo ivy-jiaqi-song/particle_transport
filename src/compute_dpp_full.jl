@@ -320,7 +320,7 @@ end
 function copy_cache_metadata!(file, cache_h5)
     cache_h5 === nothing && return nothing
     h5open(cache_h5, "r") do cache_file
-        for key in ("energy_GeV", "dt_s", "dt_tOmega0", "dt_gyroperiods", "Omega0", "B0_T", "reference_gyroperiod_s", "time_reference_name", "time_reference_B0_definition", "time_reference_energy_definition", "requested_trajectory_duration_gyroperiods", "actual_trajectory_duration_gyroperiods", "actual_trajectory_duration_tOmega0", "actual_trajectory_duration_s", "requested_integration_steps_per_gyroperiod", "actual_integration_steps_per_gyroperiod", "timestep_limited_by", "requested_trajectory_save_interval_gyroperiods", "actual_trajectory_save_interval_gyroperiods", "n_particles", "trajectory_time_stride", "boundary_mode", "cache_mode", "momentum_unit", "injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
+        for key in ("energy_GeV", "dt_s", "dt_tOmega0", "dt_gyroperiods", "Omega0", "B0_T", "Omega0_reference_s_inv", "B0_reference_T", "reference_gyroperiod_s", "time_reference_name", "time_reference_mode", "time_reference_definition", "time_reference_B0_definition", "time_reference_energy_definition", "time_reference_source_mode", "time_reference_source_path", "time_reference_source_identity", "time_reference_field_subset", "requested_trajectory_duration_gyroperiods", "actual_trajectory_duration_gyroperiods", "actual_integration_duration_gyroperiods", "analysis_cache_duration_gyroperiods", "actual_trajectory_duration_tOmega0", "actual_trajectory_duration_s", "requested_integration_steps_per_gyroperiod", "actual_integration_steps_per_gyroperiod", "timestep_limited_by", "requested_trajectory_save_interval_gyroperiods", "actual_trajectory_save_interval_gyroperiods", "integration_step_count", "analysis_sample_count", "exact_final_state_stored", "trajectory_mode", "trajectory_field_source_path", "trajectory_field_source_identity", "n_particles", "trajectory_time_stride", "boundary_mode", "cache_mode", "momentum_unit", "injection_mode", "injection_mu0", "injection_position_mode", "injection_position", "injection_position_unit")
             haskey(cache_file, key) && !haskey(file, key) && (file[key] = read(cache_file[key]))
         end
     end
@@ -360,6 +360,13 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
             dpp_group["tau_gyroperiods"] = lag_grid.tau_gyroperiods
             dpp_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
             file["lag_mapping_max_error_gyroperiods"] = Float64[lag_grid.max_lag_mapping_error_gyroperiods]
+            file["lag_mapping_max_relative_error"] = Float64[lag_grid.max_lag_mapping_relative_error]
+            file["requested_lag_count"] = Int[lag_grid.requested_lag_count]
+            file["unique_lag_count"] = Int[lag_grid.unique_lag_count]
+            file["duplicate_lag_mapping_count"] = Int[lag_grid.duplicate_lag_mapping_count]
+            file["cache_lag_min_gyroperiods"] = Float64[lag_grid.cache_lag_min_gyroperiods]
+            file["cache_lag_max_gyroperiods"] = Float64[lag_grid.cache_lag_max_gyroperiods]
+            file["cache_save_interval_gyroperiods"] = Float64[lag_grid.cache_save_interval_gyroperiods]
             file["lag_grid_source"] = string(lag_grid.lag_source)
         else
             dpp_group["requested_tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)
@@ -421,7 +428,7 @@ function run_dpp_full(cfg)
         t_norm = Float64.(read(trajectory_file["t_norm"]))
         t_gyroperiods = haskey(trajectory_file, "t_gyroperiods") ? Float64.(read(trajectory_file["t_gyroperiods"])) : t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = validate_phase_space_layout(momenta_dataset, t_s, t_norm)
-        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="D_pp trajectory time axes")
+        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="D_pp trajectory time axes", require_uniform=true)
         total_particles = size(momenta_dataset, 1)
         particle_indices = build_particle_indices(total_particles, cfg)
         first_particle = first(particle_indices)
@@ -429,6 +436,9 @@ function run_dpp_full(cfg)
         selected_particle_count = length(particle_indices)
         selected_particle_count > 0 || error("No particles selected.")
         lag_grid = resolve_lag_grid(cfg, t_gyroperiods)
+        if lag_grid.duplicate_lag_mapping_count > 0 && lag_grid.duplicate_lag_mapping_count / lag_grid.requested_lag_count > 0.10
+            @warn "Requested D_pp lag grid collapsed substantially after mapping to cached-step offsets." requested=lag_grid.requested_lag_count unique=lag_grid.unique_lag_count duplicates=lag_grid.duplicate_lag_mapping_count
+        end
         lag_steps = lag_grid.lag_steps
         tau_s = [Float64(t_s[lag_step + 1] - t_s[1]) for lag_step in lag_steps]
         tau_norm = Float64.(lag_grid.tau_norm)

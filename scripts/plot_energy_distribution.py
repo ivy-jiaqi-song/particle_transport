@@ -53,13 +53,57 @@ def resolve_base_total(campaign_folder: str) -> tuple[str, str]:
     )
 
 
+def read_scalar(handle, name: str):
+    if name not in handle:
+        return None
+    value = handle[name][()]
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def resolve_time_gyroperiods(handle):
+    if "t_gyroperiods" in handle:
+        return np.asarray(handle["t_gyroperiods"][:], dtype=float)
+    if "t_norm" in handle:
+        return np.asarray(handle["t_norm"][:], dtype=float) / (2.0 * np.pi)
+    omega0 = read_scalar(handle, "Omega0_reference_s_inv")
+    if omega0 is None:
+        omega0 = read_scalar(handle, "Omega0")
+    if "t_s" in handle and omega0 is not None:
+        return np.asarray(handle["t_s"][:], dtype=float) * float(omega0) / (2.0 * np.pi)
+    raise ValueError(
+        f"Cannot resolve reference-gyroperiod time axis in {handle.filename}; "
+        "need t_gyroperiods, t_norm, or t_s plus Omega0."
+    )
+
+
+def resolve_snapshot_time_gyroperiods(handle):
+    group = handle["energy_snapshots"]
+    if "snapshot_t_gyroperiods" in group:
+        return np.asarray(group["snapshot_t_gyroperiods"][:], dtype=float)
+    if "snapshot_t_norm" in group:
+        return np.asarray(group["snapshot_t_norm"][:], dtype=float) / (2.0 * np.pi)
+    omega0 = read_scalar(handle, "Omega0_reference_s_inv")
+    if omega0 is None:
+        omega0 = read_scalar(handle, "Omega0")
+    if "snapshot_t_s" in group and omega0 is not None:
+        return np.asarray(group["snapshot_t_s"][:], dtype=float) * float(omega0) / (2.0 * np.pi)
+    raise ValueError(
+        f"Cannot resolve snapshot reference-gyroperiod time axis in {handle.filename}; "
+        "need snapshot_t_gyroperiods, snapshot_t_norm, or snapshot_t_s plus Omega0."
+    )
+
+
 def load_from_cache_phase_space(base_total: str, energy_dir: str):
     path = os.path.join(base_total, "cache", f"phase_space_{energy_dir}.h5")
     if not os.path.isfile(path):
         return None
     with h5py.File(path, "r") as handle:
         momenta = handle["momenta"][:]
-        t_axis = handle["t_gyroperiods"][:] if "t_gyroperiods" in handle else handle["t_s"][:]
+        t_axis = resolve_time_gyroperiods(handle)
     if momenta.ndim != 3 or momenta.shape[1] != 3:
         raise ValueError(f"Unsupported momenta layout in {path}: expected a 3D array with vector axis 1")
     if momenta.shape[0] == len(t_axis):
@@ -78,7 +122,7 @@ def load_from_dpp_energy_snapshots(base_total: str, energy_dir: str):
         return None
     with h5py.File(path, "r") as handle:
         energy_gev = handle["energy_snapshots/energy_GeV"][:]
-        t_axis = handle["energy_snapshots/snapshot_t_gyroperiods"][:] if "energy_snapshots/snapshot_t_gyroperiods" in handle else handle["energy_snapshots/snapshot_t_s"][:]
+        t_axis = resolve_snapshot_time_gyroperiods(handle)
     return energy_gev.T, t_axis, f"{energy_dir}/dpp_full.h5 (energy_GeV, already GeV)"
 
 

@@ -1,6 +1,7 @@
 const REFERENCE_GYROPERIOD_NAME = "reference gyroperiod"
-const TIME_REFERENCE_B0_DEFINITION = "B0_T = mean(sqrt(Bx^2 + By^2 + Bz^2)) after magnetic-field conversion to tesla over the loaded trajectory field grid"
-const TIME_REFERENCE_ENERGY_DEFINITION = "Omega0 = q_e * B0_T / (gamma0 * m_p), where gamma0 is computed from the configured particle kinetic energy"
+const TIME_REFERENCE_MODE = "total-field-mean-magnitude"
+const TIME_REFERENCE_B0_DEFINITION = "B0_reference_T = mean(sqrt(Bx_total^2 + By_total^2 + Bz_total^2)) after magnetic-field conversion to tesla over the loaded reference grid"
+const TIME_REFERENCE_ENERGY_DEFINITION = "Omega0_reference_s_inv = q_e * B0_reference_T / (gamma0 * m_p), where gamma0 is computed from the configured particle kinetic energy"
 
 reference_gyroperiod_s(Omega0::Real) = 2.0 * pi / Float64(Omega0)
 gyroperiods_to_tOmega0(n_gyroperiods::Real) = 2.0 * pi * Float64(n_gyroperiods)
@@ -20,6 +21,24 @@ end
 
 function reference_Omega0(B0_T::Real, gamma0::Real, charge_C::Real, mass_kg::Real)
     return Float64(charge_C) * Float64(B0_T) / (Float64(gamma0) * Float64(mass_kg))
+end
+
+function campaign_time_reference(B0_reference_T::Real, Omega0_reference_s_inv::Real; source_mode::AbstractString="total", source_path::AbstractString="", source_identity::AbstractString=source_path, field_subset="nothing")
+    Omega0 = Float64(Omega0_reference_s_inv)
+    B0 = Float64(B0_reference_T)
+    return (
+        B0_reference_T = B0,
+        Omega0_reference_s_inv = Omega0,
+        reference_gyroperiod_s = reference_gyroperiod_s(Omega0),
+        time_reference_mode = TIME_REFERENCE_MODE,
+        time_reference_name = REFERENCE_GYROPERIOD_NAME,
+        time_reference_definition = TIME_REFERENCE_B0_DEFINITION,
+        time_reference_energy_definition = TIME_REFERENCE_ENERGY_DEFINITION,
+        time_reference_source_mode = String(source_mode),
+        time_reference_source_path = String(source_path),
+        time_reference_source_identity = String(source_identity),
+        time_reference_field_subset = string(field_subset),
+    )
 end
 
 function resolve_eta_requested(cfg)
@@ -123,7 +142,7 @@ function t_gyroperiods_from_axes(t_s, t_norm, Omega0=nothing)
     error("Cannot resolve t_gyroperiods without t_norm or Omega0.")
 end
 
-function validate_time_axes(t_s, t_norm, t_gyroperiods; key_name::AbstractString="time axes")
+function validate_time_axes(t_s, t_norm, t_gyroperiods; key_name::AbstractString="time axes", require_uniform::Bool=false, rtol::Real=1.0e-10, atol::Real=1.0e-12)
     n = length(t_s)
     length(t_norm) == n || error(key_name * ": t_norm length does not match t_s.")
     length(t_gyroperiods) == n || error(key_name * ": t_gyroperiods length does not match t_s.")
@@ -135,7 +154,28 @@ function validate_time_axes(t_s, t_norm, t_gyroperiods; key_name::AbstractString
     all(diff(Float64.(t_norm)) .> 0.0) || error(key_name * ": t_norm must be strictly increasing.")
     all(diff(Float64.(t_gyroperiods)) .> 0.0) || error(key_name * ": t_gyroperiods must be strictly increasing.")
     all(isapprox.(Float64.(t_norm) ./ (2.0 * pi), Float64.(t_gyroperiods); rtol=1.0e-10, atol=1.0e-12)) || error(key_name * ": t_norm and t_gyroperiods are inconsistent.")
+    if require_uniform
+        intervals = diff(Float64.(t_gyroperiods))
+        save_interval = first(intervals)
+        all(abs.(intervals .- save_interval) .<= Float64(atol) .+ Float64(rtol) .* abs(save_interval)) || error(key_name * ": saved analysis time axis is not uniformly spaced; regenerate the cache or use a uniform legacy prefix.")
+    end
     return n
+end
+
+function uniform_prefix_length(t_gyroperiods; rtol::Real=1.0e-10, atol::Real=1.0e-12)
+    n = length(t_gyroperiods)
+    n <= 2 && return n
+    intervals = diff(Float64.(t_gyroperiods))
+    expected = first(intervals)
+    prefix = 1
+    for interval in intervals
+        if abs(interval - expected) <= Float64(atol) + Float64(rtol) * abs(expected)
+            prefix += 1
+        else
+            break
+        end
+    end
+    return prefix
 end
 
 function requested_lag_grid_gyroperiods(cfg, max_cache_lag_step::Integer, t_gyroperiods)
@@ -173,12 +213,23 @@ function requested_lag_grid_gyroperiods(cfg, max_cache_lag_step::Integer, t_gyro
     return [Float64(t_gyroperiods[step + 1] - t_gyroperiods[1]) for step in legacy_steps], :legacy_steps
 end
 
-function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=1)
+function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=2)
     nsteps = length(t_gyroperiods)
     nsteps > 1 || error("Need at least two cached samples to resolve lags.")
     max_cache_lag_step = nsteps - 1
     requested_tau_gp, source = requested_lag_grid_gyroperiods(cfg, max_cache_lag_step, t_gyroperiods)
     isempty(requested_tau_gp) && error("No requested lag values were generated.")
+
+    offsets = Float64.(t_gyroperiods[2:end]) .- Float64(t_gyroperiods[1])
+    cache_min_gp = first(offsets)
+    cache_max_gp = last(offsets)
+    cache_save_interval_gp = length(offsets) == 1 ? cache_min_gp : first(diff(Float64.(t_gyroperiods)))
+    requested_min_gp = minimum(Float64.(requested_tau_gp))
+    requested_max_gp = maximum(Float64.(requested_tau_gp))
+    tolerance = 1.0e-12 + 1.0e-10 * max(abs(cache_save_interval_gp), abs(cache_max_gp), 1.0)
+    if requested_min_gp < cache_min_gp - tolerance || requested_max_gp > cache_max_gp + tolerance
+        error("Requested lag range [$(requested_min_gp), $(requested_max_gp)] reference gyroperiods is outside representable cache range [$(cache_min_gp), $(cache_max_gp)] reference gyroperiods. Cache save interval is $(cache_save_interval_gp) reference gyroperiods and cache duration is $(cache_max_gp) reference gyroperiods. Adjust lag_min_gyroperiods/lag_max_gyroperiods or regenerate the cache with a different trajectory_save_interval_gyroperiods or trajectory_duration_gyroperiods.")
+    end
 
     lag_steps = Int[]
     requested_unique_gp = Float64[]
@@ -187,17 +238,18 @@ function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=1)
     seen = Set{Int}()
     for requested_gp in requested_tau_gp
         isfinite(requested_gp) && requested_gp > 0.0 || error("Requested lag values must be finite and positive reference gyroperiods.")
-        offsets = Float64.(t_gyroperiods[2:end]) .- Float64(t_gyroperiods[1])
         nearest_local = argmin(abs.(offsets .- requested_gp))
         lag_step = Int(nearest_local)
         1 <= lag_step <= max_cache_lag_step || error("Resolved lag step is outside the cached trajectory.")
+        mapping_error = abs(Float64(offsets[nearest_local]) - Float64(requested_gp))
+        mapping_error <= 0.5 * cache_save_interval_gp + tolerance || error("Internal lag mapping inconsistency: requested $(requested_gp) reference gyroperiods mapped to $(offsets[nearest_local]), exceeding half the cache interval $(cache_save_interval_gp / 2).")
         if !(lag_step in seen)
             push!(seen, lag_step)
             push!(lag_steps, lag_step)
             push!(requested_unique_gp, Float64(requested_gp))
             actual = Float64(t_gyroperiods[lag_step + 1] - t_gyroperiods[1])
             push!(actual_gp, actual)
-            push!(errors_gp, abs(actual - Float64(requested_gp)))
+            push!(errors_gp, mapping_error)
         end
     end
     length(lag_steps) >= min_unique_lags || error("Lag grid resolved to fewer than $(min_unique_lags) unique positive cached-step offsets.")
@@ -214,23 +266,39 @@ function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=1)
         tau_norm = tau_norm,
         lag_mapping_error_gyroperiods = errors_gp,
         max_lag_mapping_error_gyroperiods = isempty(errors_gp) ? 0.0 : maximum(errors_gp),
+        max_lag_mapping_relative_error = isempty(errors_gp) ? 0.0 : maximum(errors_gp ./ max.(abs.(requested_unique_gp), eps(Float64))),
+        requested_lag_count = length(requested_tau_gp),
+        unique_lag_count = length(lag_steps),
+        duplicate_lag_mapping_count = length(requested_tau_gp) - length(lag_steps),
+        cache_lag_min_gyroperiods = cache_min_gp,
+        cache_lag_max_gyroperiods = cache_max_gp,
+        cache_save_interval_gyroperiods = cache_save_interval_gp,
         lag_source = source,
     )
 end
 
-function write_time_reference_metadata!(file, Omega0::Real, B0_T::Real)
-    file["Omega0"] = Float64[Omega0]
-    file["B0_T"] = Float64[B0_T]
-    file["reference_gyroperiod_s"] = Float64[reference_gyroperiod_s(Omega0)]
+function write_time_reference_metadata!(file, time_reference)
+    file["Omega0"] = Float64[time_reference.Omega0_reference_s_inv]
+    file["B0_T"] = Float64[time_reference.B0_reference_T]
+    file["Omega0_reference_s_inv"] = Float64[time_reference.Omega0_reference_s_inv]
+    file["B0_reference_T"] = Float64[time_reference.B0_reference_T]
+    file["reference_gyroperiod_s"] = Float64[time_reference.reference_gyroperiod_s]
     file["time_reference_name"] = REFERENCE_GYROPERIOD_NAME
-    file["time_reference_B0_definition"] = TIME_REFERENCE_B0_DEFINITION
-    file["time_reference_energy_definition"] = TIME_REFERENCE_ENERGY_DEFINITION
+    file["time_reference_mode"] = time_reference.time_reference_mode
+    file["time_reference_definition"] = time_reference.time_reference_definition
+    file["time_reference_B0_definition"] = time_reference.time_reference_definition
+    file["time_reference_energy_definition"] = time_reference.time_reference_energy_definition
+    file["time_reference_source_mode"] = time_reference.time_reference_source_mode
+    file["time_reference_source_path"] = time_reference.time_reference_source_path
+    file["time_reference_source_identity"] = time_reference.time_reference_source_identity
+    file["time_reference_field_subset"] = time_reference.time_reference_field_subset
     return nothing
 end
 
 function write_trajectory_time_metadata!(file, trajectory_time, save_time)
     file["requested_trajectory_duration_gyroperiods"] = Float64[trajectory_time.requested_trajectory_duration_gyroperiods]
     file["actual_trajectory_duration_gyroperiods"] = Float64[trajectory_time.actual_trajectory_duration_gyroperiods]
+    file["actual_integration_duration_gyroperiods"] = Float64[trajectory_time.actual_trajectory_duration_gyroperiods]
     file["actual_trajectory_duration_tOmega0"] = Float64[trajectory_time.actual_trajectory_duration_tOmega0]
     file["actual_trajectory_duration_s"] = Float64[trajectory_time.actual_trajectory_duration_s]
     file["requested_integration_steps_per_gyroperiod"] = Float64[trajectory_time.requested_integration_steps_per_gyroperiod]

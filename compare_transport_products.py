@@ -73,6 +73,7 @@ class Product:
     dmumu_tau_average: np.ndarray
     dmumu_start_mode: str
     mu_bin_abs: bool
+    reference_clock: tuple
 
 
 def parse_args() -> argparse.Namespace:
@@ -343,6 +344,33 @@ def normalize_dmumu_start_mode(value) -> str:
     return "sliding"
 
 
+def product_reference_clock(h5: h5py.File) -> tuple:
+    source = read_scalar(h5, "time_reference_source_identity", read_scalar(h5, "time_reference_source_path", ""))
+    mode = read_scalar(h5, "time_reference_source_mode", "")
+    b0 = float(read_scalar(h5, "B0_reference_T", read_scalar(h5, "B0_T", np.nan)))
+    omega0 = float(read_scalar(h5, "Omega0_reference_s_inv", read_scalar(h5, "Omega0", np.nan)))
+    tg0 = float(read_scalar(h5, "reference_gyroperiod_s", np.nan))
+    return (str(mode), str(source), b0, omega0, tg0)
+
+
+def validate_common_reference_clock(products: list[Product]) -> None:
+    if len(products) <= 1:
+        return
+    base = products[0].reference_clock
+    for product in products[1:]:
+        current = product.reference_clock
+        same_text = base[0] == current[0] and base[1] == current[1]
+        same_numbers = all(
+            math.isclose(float(a), float(b), rel_tol=1.0e-10, abs_tol=0.0)
+            for a, b in zip(base[2:], current[2:])
+        )
+        if not (same_text and same_numbers):
+            raise ValueError(
+                "Refusing to overlay products with different time-reference clocks: "
+                f"{products[0].ref.path} has {base}, {product.ref.path} has {current}"
+            )
+
+
 def product_mu_axis_label(product: Product) -> str:
     if product.mu_bin_abs:
         return r"$|\mu_0|$" if product.dmumu_start_mode == "injection" else r"$|\mu(t)|$"
@@ -377,6 +405,7 @@ def load_product(ref: ProductRef, dmumu_variant: str) -> Product:
             dmumu_tau_average=read_array(dmumu_group, dataset_name),
             dmumu_start_mode=normalize_dmumu_start_mode(read_scalar(h5, "dmumu_start_mode", "sliding")),
             mu_bin_abs=read_bool(h5, "mu_bin_abs", False),
+            reference_clock=product_reference_clock(h5),
         )
 
 
@@ -416,6 +445,7 @@ def plot_product_group(
     draw_sem: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    validate_common_reference_clock(products)
     colors = style_for_count(len(products))
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.6))
     delta_floor = finite_positive_floor(product.delta_mu2_mean for product in products)

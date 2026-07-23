@@ -872,6 +872,13 @@ function save_combined_full_h5(
                 dmumu_group["tau_gyroperiods"] = lag_grid.tau_gyroperiods
                 dmumu_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
                 file["lag_mapping_max_error_gyroperiods"] = Float64[lag_grid.max_lag_mapping_error_gyroperiods]
+                file["lag_mapping_max_relative_error"] = Float64[lag_grid.max_lag_mapping_relative_error]
+                file["requested_lag_count"] = Int[lag_grid.requested_lag_count]
+                file["unique_lag_count"] = Int[lag_grid.unique_lag_count]
+                file["duplicate_lag_mapping_count"] = Int[lag_grid.duplicate_lag_mapping_count]
+                file["cache_lag_min_gyroperiods"] = Float64[lag_grid.cache_lag_min_gyroperiods]
+                file["cache_lag_max_gyroperiods"] = Float64[lag_grid.cache_lag_max_gyroperiods]
+                file["cache_save_interval_gyroperiods"] = Float64[lag_grid.cache_save_interval_gyroperiods]
                 file["lag_grid_source"] = string(lag_grid.lag_source)
             else
                 dmumu_group["requested_tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)
@@ -1020,7 +1027,7 @@ function run_combined_full(cfg)
         t_norm = Float64.(read(trajectory_file["t_norm"]))
         t_gyroperiods = haskey(trajectory_file, "t_gyroperiods") ? Float64.(read(trajectory_file["t_gyroperiods"])) : t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = validate_trajectory_layout(positions_dataset, momenta_dataset, t_s, t_norm)
-        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Trajectory HDF5 time axes")
+        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Trajectory HDF5 time axes", require_uniform=true)
         total_particles = size(positions_dataset, 1)
 
         particle_indices = build_particle_indices(total_particles, cfg)
@@ -1030,6 +1037,9 @@ function run_combined_full(cfg)
         selected_particle_count > 0 || error("No particles selected.")
 
         lag_grid = resolve_lag_grid(cfg, t_gyroperiods)
+        if lag_grid.duplicate_lag_mapping_count > 0 && lag_grid.duplicate_lag_mapping_count / lag_grid.requested_lag_count > 0.10
+            @warn "Requested D_mumu lag grid collapsed substantially after mapping to cached-step offsets." requested=lag_grid.requested_lag_count unique=lag_grid.unique_lag_count duplicates=lag_grid.duplicate_lag_mapping_count
+        end
         lag_steps = lag_grid.lag_steps
         tau_s = [Float64(t_s[lag_step + 1] - t_s[1]) for lag_step in lag_steps]
         tau_norm = Float64.(lag_grid.tau_norm)

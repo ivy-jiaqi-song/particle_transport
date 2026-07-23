@@ -13,10 +13,16 @@ medium = "mp"  # "iso" for isothermal, "mp" for multiphase.
 # File naming. With mode_decomposition_available=true, files default to
 # <file_stem>_alfven.h5, <file_stem>_fast.h5, and <file_stem>_slow.h5.
 file_stem = "MP_WeakB_0_5tcs"
+total_file = "MP_WeakB_0_5tcs.h5"
+
+# The total field is required and is always used for the shared reference clock.
+# If mode decomposition is enabled, mode files are searched in the same directory.
+mode_decomposition_available = true
+available_modes = ["alfven", "fast", "slow"]
 mode_file_pattern = "{stem}_{mode}.h5"
 
-# If mode_decomposition_available=false, the pipeline reads total_file instead.
-# total_file = "MP_WeakB_0_5tcs.h5"
+[time_reference]
+mode = "total-field-mean-magnitude"
 
 [output]
 root = "outputs/campaigns_cache"
@@ -35,11 +41,6 @@ compute_dmumu = true
 # phase-space cache; the runner switches cache_mode to "phase-space" when true.
 # D_pp writes dpp_full.h5 separately from the D_mumu product.
 compute_dpp = false
-
-# Mode repetition logic. If true, the input directory contains mode files with
-# suffixes such as _alfven, _fast, and _slow. If false, only total_file is used.
-mode_decomposition_available = true
-available_modes = ["alfven", "fast", "slow"]
 
 # Full repeat: every selected energy for every selected mode.
 energies_gev = [1e5, 1e6, 1e7]

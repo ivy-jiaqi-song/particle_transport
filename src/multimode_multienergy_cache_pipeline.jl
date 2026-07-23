@@ -245,10 +245,8 @@ function format_input_pattern(pattern, stem::AbstractString, mode_name::Abstract
 end
 
 function generic_total_h5_path(input_spec)
-    if input_spec[:total_file] !== nothing
-        return input_file_path(input_spec, input_spec[:total_file])
-    end
-    return input_file_path(input_spec, input_file_stem(input_spec) * ".h5")
+    input_spec[:total_file] === nothing && error("[input].total_file is required and must point to the total-field HDF5 used for the shared time reference.")
+    return input_file_path(input_spec, input_spec[:total_file])
 end
 
 function generic_mode_h5_path(input_spec, mode_name::AbstractString)
@@ -266,12 +264,27 @@ function build_generic_campaigns(root_prefix::AbstractString, input_spec, mode_d
     label = input_label(input_spec)
     medium = normalize_medium(input_spec[:medium])
     base_root = joinpath(root_prefix, medium, label)
+    total_h5 = generic_total_h5_path(input_spec)
 
     campaigns = Dict{Symbol, Any}[]
+    push!(
+        campaigns,
+        Dict{Symbol, Any}(
+            :campaign_tag => medium * "/" * label * "/total",
+            :campaign_aliases => [label * "/total", label],
+            :medium => medium,
+            :turbulence_tag => label,
+            :mode_name => "total",
+            :campaign_root => joinpath(base_root, "total"),
+            :turbulence_h5 => total_h5,
+            :reference_h5 => total_h5,
+        ),
+    )
     if mode_decomposition_available
         for mode_name in available_modes
             mode_name = strip(String(mode_name))
             isempty(mode_name) && error("[run].available_modes cannot contain empty mode names.")
+            lowercase(mode_name) == "total" && continue
             push!(
                 campaigns,
                 Dict{Symbol, Any}(
@@ -282,27 +295,16 @@ function build_generic_campaigns(root_prefix::AbstractString, input_spec, mode_d
                     :mode_name => mode_name,
                     :campaign_root => joinpath(base_root, mode_name),
                     :turbulence_h5 => generic_mode_h5_path(input_spec, mode_name),
+                    :reference_h5 => total_h5,
                 ),
             )
         end
-    else
-        push!(
-            campaigns,
-            Dict{Symbol, Any}(
-                :campaign_tag => medium * "/" * label * "/total",
-                :campaign_aliases => [label * "/total", label],
-                :medium => medium,
-                :turbulence_tag => label,
-                :mode_name => "total",
-                :campaign_root => joinpath(base_root, "total"),
-                :turbulence_h5 => generic_total_h5_path(input_spec),
-            ),
-        )
     end
     return campaigns
 end
 
 function build_mode_campaigns(root_prefix::AbstractString, input_paths)
+    error("Legacy mp-weakb layout no longer has enough information to resolve the required total-field reference. Use [input].h5_dir and [input].total_file.")
     campaigns = Dict{Symbol, Any}[]
     for turbulence_tag in TURBULENCE_TAGS
         for mode_name in MODE_NAMES
@@ -335,6 +337,7 @@ function build_mhd512_campaigns(root_prefix::AbstractString, input_paths)
             :mode_name => "total",
             :campaign_root => joinpath(root_prefix, MHD512_DATASET_TAG, "total"),
             :turbulence_h5 => input_paths[:mhd512_total_h5],
+            :reference_h5 => input_paths[:mhd512_total_h5],
         ),
     )
 
@@ -347,6 +350,7 @@ function build_mhd512_campaigns(root_prefix::AbstractString, input_paths)
                 :mode_name => mode_name,
                 :campaign_root => joinpath(root_prefix, MHD512_DATASET_TAG, mode_name),
                 :turbulence_h5 => mhd512_mode_h5_path(input_paths, mode_name),
+                :reference_h5 => input_paths[:mhd512_total_h5],
             ),
         )
     end
@@ -440,6 +444,8 @@ end
 
 function validate_mode_files(campaigns)
     missing = [campaign[:turbulence_h5] for campaign in campaigns if !isfile(campaign[:turbulence_h5])]
+    append!(missing, [campaign[:reference_h5] for campaign in campaigns if !isfile(campaign[:reference_h5])])
+    missing = unique(missing)
     isempty(missing) && return nothing
     error("Missing input HDF5 file(s):\n" * join(missing, "\n"))
 end
@@ -473,7 +479,7 @@ function verify_phase_space_cache_h5(path_h5::AbstractString)
         length(t_s) == nsteps || error("Phase-space verification failed: t_s length mismatch for " * path_h5)
         length(t_norm) == nsteps || error("Phase-space verification failed: t_norm length mismatch for " * path_h5)
         length(t_gyroperiods) == nsteps || error("Phase-space verification failed: t_gyroperiods length mismatch for " * path_h5)
-        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Phase-space cache time axes")
+        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Phase-space cache time axes", require_uniform=true)
         length(alive_fraction) == nsteps || error("Phase-space verification failed: alive_fraction length mismatch for " * path_h5)
         nsteps > 1 || error("Phase-space verification failed: not enough saved steps in " * path_h5)
     end
@@ -492,7 +498,7 @@ function verify_mu_cache_h5(path_h5::AbstractString)
         length(t_s) == nsteps || error("Mu-cache verification failed: t_s length mismatch for " * path_h5)
         length(t_norm) == nsteps || error("Mu-cache verification failed: t_norm length mismatch for " * path_h5)
         length(t_gyroperiods) == nsteps || error("Mu-cache verification failed: t_gyroperiods length mismatch for " * path_h5)
-        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes")
+        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes", require_uniform=true)
         length(alive_fraction) == nsteps || error("Mu-cache verification failed: alive_fraction length mismatch for " * path_h5)
         size(mu, 1) > 0 || error("Mu-cache verification failed: zero particles in " * path_h5)
         nsteps > 1 || error("Mu-cache verification failed: not enough saved steps in " * path_h5)
@@ -575,37 +581,54 @@ function verify_combined_outputs(path_h5::AbstractString, delta_png::AbstractStr
     return true
 end
 
-function expected_time_resolution(cfg, fields, energy_GeV)
+function resolve_energy_time_reference(cfg, reference_fields, energy_GeV, reference_h5::AbstractString)
+    T = cfg[:precision]
+    Bx, By, Bz = reference_fields[1], reference_fields[2], reference_fields[3]
+    B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
+    gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
+    Omega0 = RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P)
+    return RunnerMod.campaign_time_reference(
+        B0,
+        Omega0;
+        source_mode="total",
+        source_path=reference_h5,
+        source_identity=reference_h5,
+        field_subset=get(cfg, :field_subset, nothing),
+    )
+end
+
+function expected_time_resolution(cfg, fields, energy_GeV, time_reference)
     T = cfg[:precision]
     Bx, By, Bz = fields[1], fields[2], fields[3]
     nx, ny, nz = size(Bx)
     x, y, z = RunnerMod.build_uniform_coords(cfg, nx, ny, nz, T)
-    B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
-    gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
-    Omega0 = RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P)
+    Omega0 = time_reference.Omega0_reference_s_inv
     v0 = RunnerMod.energy_to_speed(energy_GeV, T)
     trajectory_time = RunnerMod.resolve_trajectory_time_grid(cfg, Omega0, v0, RunnerMod.estimate_min_dx(x, y, z))
     save_time = RunnerMod.resolve_save_stride(cfg, trajectory_time)
-    return trajectory_time, save_time, Float64(Omega0), Float64(B0)
+    return trajectory_time, save_time, Float64(Omega0), Float64(time_reference.B0_reference_T)
 end
 
-function verify_cache_time_metadata(path_h5::AbstractString, cfg, fields, energy_GeV)
-    trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(cfg, fields, energy_GeV)
+function verify_cache_time_metadata(path_h5::AbstractString, cfg, fields, energy_GeV, time_reference)
+    trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(cfg, fields, energy_GeV, time_reference)
     h5open(path_h5, "r") do file
         t_s = Float64.(read(file["t_s"]))
         t_norm = Float64.(read(file["t_norm"]))
         t_gyroperiods = haskey(file, "t_gyroperiods") ? Float64.(read(file["t_gyroperiods"])) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
-        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Existing cache time axes")
+        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Existing cache time axes", require_uniform=true)
         stored_Omega0 = h5_scalar_float_or(file, "Omega0", nothing)
         stored_B0 = h5_scalar_float_or(file, "B0_T", nothing)
         stored_dt = h5_scalar_float_or(file, "dt_s", nothing)
         stored_stride = h5_scalar_int_or(file, "trajectory_time_stride", save_time.trajectory_time_stride)
         stored_Omega0 === nothing || isapprox(stored_Omega0, expected_Omega0; rtol=1.0e-10, atol=0.0) || error("Existing cache Omega0 does not match requested time reference; regenerate " * path_h5)
         stored_B0 === nothing || isapprox(stored_B0, expected_B0; rtol=1.0e-10, atol=0.0) || error("Existing cache B0_T does not match requested time reference; regenerate " * path_h5)
+        stored_reference_source = h5_scalar_string_or(file, "time_reference_source_path", "")
+        isempty(stored_reference_source) || stored_reference_source == time_reference.time_reference_source_path || error("Existing cache time_reference_source_path does not match requested total-field reference; regenerate " * path_h5)
         stored_dt === nothing || isapprox(stored_dt, trajectory_time.dt_s; rtol=1.0e-10, atol=0.0) || error("Existing cache dt_s does not match requested integration resolution; regenerate " * path_h5)
         stored_stride == save_time.trajectory_time_stride || error("Existing cache trajectory_time_stride does not match requested save interval; regenerate " * path_h5)
-        actual_duration_gp = Float64(t_gyroperiods[end] - t_gyroperiods[1])
-        isapprox(actual_duration_gp, trajectory_time.actual_trajectory_duration_gyroperiods; rtol=1.0e-10, atol=1.0e-12) || error("Existing cache duration does not match requested trajectory duration; regenerate " * path_h5)
+        analysis_duration_gp = Float64(t_gyroperiods[end] - t_gyroperiods[1])
+        expected_analysis_duration_gp = (length(t_gyroperiods) - 1) * save_time.actual_trajectory_save_interval_gyroperiods
+        isapprox(analysis_duration_gp, expected_analysis_duration_gp; rtol=1.0e-10, atol=1.0e-12) || error("Existing cache analysis duration does not match requested uniform cache cadence; regenerate " * path_h5)
     end
     return true
 end
@@ -919,7 +942,7 @@ function write_mu_cache_step!(writer, save_idx::Integer, mu_step)
     return nothing
 end
 
-function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, Omega0, B0)
+function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, time_reference)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
@@ -927,8 +950,15 @@ function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_sav
     file["alive_fraction"] = Float64.(alive_fraction_save)
     file["energy_GeV"] = Float64[energy_GeV]
     file["n_particles"] = Int[cfg[:n_particles]]
-    RunnerMod.write_time_reference_metadata!(file, Omega0, B0)
+    RunnerMod.write_time_reference_metadata!(file, time_reference)
     RunnerMod.write_trajectory_time_metadata!(file, trajectory_time, save_time)
+    file["analysis_cache_duration_gyroperiods"] = Float64[t_gyroperiods_save[end] - t_gyroperiods_save[1]]
+    file["integration_step_count"] = Int[trajectory_time.n_integration_steps]
+    file["analysis_sample_count"] = Int[length(t_gyroperiods_save)]
+    file["exact_final_state_stored"] = false
+    file["trajectory_mode"] = string(get(cfg, :trajectory_mode, "unknown"))
+    file["trajectory_field_source_path"] = string(get(cfg, :trajectory_field_source_path, cfg[:file]))
+    file["trajectory_field_source_identity"] = string(get(cfg, :trajectory_field_source_identity, get(cfg, :trajectory_field_source_path, cfg[:file])))
     file["boundary_mode"] = string(cfg[:boundary])
     file["cache_mode"] = "mu"
     file["cache_output_precision"] = string(writer.outtype)
@@ -965,7 +995,7 @@ function reconstruct_mu_step_kernel!(mu_step, x1_step, x2_step, x3_step, p1_step
     return
 end
 
-function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_GeV)
+function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_GeV, time_reference=nothing)
     T = cfg[:precision]
     Bx, By, Bz, vx, vy, vz = fields
     nx, ny, nz = size(Bx)
@@ -979,9 +1009,13 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
 
     cache_out_type = cfg[:mu_cache_output_precision]
 
-    B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
     gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
-    Omega0 = T(RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P))
+    if time_reference === nothing
+        B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
+        Omega0_value = RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P)
+        time_reference = RunnerMod.campaign_time_reference(B0, Omega0_value; source_mode="trajectory", source_path=String(cfg[:file]), source_identity=String(cfg[:file]), field_subset=get(cfg, :field_subset, nothing))
+    end
+    Omega0 = T(time_reference.Omega0_reference_s_inv)
     v0 = RunnerMod.energy_to_speed(energy_GeV, T)
     trajectory_time = RunnerMod.resolve_trajectory_time_grid(cfg, Omega0, v0, RunnerMod.estimate_min_dx(x, y, z))
     save_time = RunnerMod.resolve_save_stride(cfg, trajectory_time)
@@ -1097,8 +1131,7 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
             alive_fraction[save_indices],
             trajectory_time,
             save_time,
-            Omega0,
-            B0,
+            time_reference,
         )
     catch
         if writer !== nothing
@@ -1118,6 +1151,8 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
         dt = Float64(dt),
         trajectory_time = trajectory_time,
         save_time = save_time,
+        B0 = Float64(time_reference.B0_reference_T),
+        time_reference = time_reference,
     )
 end
 
@@ -1162,10 +1197,18 @@ function append_cache_metadata!(path_h5::AbstractString, cache_mode::Symbol, cac
                 "dt_gyroperiods",
                 "Omega0",
                 "B0_T",
+                "Omega0_reference_s_inv",
+                "B0_reference_T",
                 "reference_gyroperiod_s",
                 "time_reference_name",
+                "time_reference_mode",
+                "time_reference_definition",
                 "time_reference_B0_definition",
                 "time_reference_energy_definition",
+                "time_reference_source_mode",
+                "time_reference_source_path",
+                "time_reference_source_identity",
+                "time_reference_field_subset",
                 "requested_trajectory_duration_gyroperiods",
                 "actual_trajectory_duration_gyroperiods",
                 "actual_trajectory_duration_tOmega0",
@@ -1177,6 +1220,13 @@ function append_cache_metadata!(path_h5::AbstractString, cache_mode::Symbol, cac
                 "actual_trajectory_save_interval_gyroperiods",
                 "n_particles",
                 "trajectory_time_stride",
+                "analysis_cache_duration_gyroperiods",
+                "integration_step_count",
+                "analysis_sample_count",
+                "exact_final_state_stored",
+                "trajectory_mode",
+                "trajectory_field_source_path",
+                "trajectory_field_source_identity",
                 "boundary_mode",
                 "trajectory_output_precision",
                 "cache_output_precision",
@@ -1216,7 +1266,7 @@ function run_combined_from_mu_cache(cfg)
         t_norm = Float64.(read(cache_file["t_norm"]))
         t_gyroperiods = haskey(cache_file, "t_gyroperiods") ? Float64.(read(cache_file["t_gyroperiods"])) : CombinedFullMod.t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = size(mu_dataset, 2)
-        CombinedFullMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes")
+        CombinedFullMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes", require_uniform=true)
         total_particles = size(mu_dataset, 1)
 
         particle_indices = CombinedFullMod.build_particle_indices(total_particles, cfg)
@@ -1226,6 +1276,9 @@ function run_combined_from_mu_cache(cfg)
         selected_particle_count > 0 || error("No particles selected.")
 
         lag_grid = CombinedFullMod.resolve_lag_grid(cfg, t_gyroperiods)
+        if lag_grid.duplicate_lag_mapping_count > 0 && lag_grid.duplicate_lag_mapping_count / lag_grid.requested_lag_count > 0.10
+            @warn "Requested D_mumu lag grid collapsed substantially after mapping to cached-step offsets." requested=lag_grid.requested_lag_count unique=lag_grid.unique_lag_count duplicates=lag_grid.duplicate_lag_mapping_count
+        end
         lag_steps = lag_grid.lag_steps
         tau_s = [Float64(t_s[lag_step + 1] - t_s[1]) for lag_step in lag_steps]
         tau_norm = Float64.(lag_grid.tau_norm)
@@ -1417,7 +1470,7 @@ function overall_product_status(dmumu_status::AbstractString, dpp_status::Abstra
     return "cache_only"
 end
 
-function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
+function run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
     paths = build_energy_paths(cfg, energy_GeV)
     mkpath(paths.cache_dir)
     mkpath(paths.science_dir)
@@ -1426,12 +1479,17 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
 
     println()
     println("=== Energy ", energy_GeV, " GeV ===")
+    time_reference = resolve_energy_time_reference(base_runner_cfg, reference_fields, energy_GeV, cfg[:reference_h5])
+    println("Energy:")
+    println("  energy                         = ", energy_GeV, " GeV")
+    println("  Omega0_reference               = ", time_reference.Omega0_reference_s_inv, " s^-1")
+    println("  reference gyroperiod           = ", time_reference.reference_gyroperiod_s, " s")
     compute_analysis = cfg[:compute_dmumu] || cfg[:compute_dpp]
 
     if !compute_analysis && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
-        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
+        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
         println("Cache already verified; transport analysis disabled for energy ", energy_GeV, " GeV")
         return summary_row(
             energy_GeV,
@@ -1462,7 +1520,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         if isfile(paths.cache_h5)
             verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
             verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
-            verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
+            verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
             deleted = delete_cache_if_requested(paths.cache_h5, cfg)
         end
         println("Requested outputs already verified; skipping energy ", energy_GeV, " GeV")
@@ -1485,17 +1543,17 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
         println("Reusing existing cache file ", paths.cache_h5)
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
-        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
+        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
     else
         if cfg[:cache_mode] == :phase_space
             runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(
                 :output_dir => paths.cache_dir,
                 :energies => [energy_GeV],
             ))
-            runner_result = RunnerMod.run_gpu_ensemble(runner_cfg, fields; energy_GeV=energy_GeV)
+            runner_result = RunnerMod.run_gpu_ensemble(runner_cfg, fields; energy_GeV=energy_GeV, time_reference=time_reference)
             verify_phase_space_cache_h5(runner_result.phase_space_path)
         elseif cfg[:cache_mode] == :mu
-            run_mu_cache_ensemble(base_runner_cfg, fields, paths.cache_h5; energy_GeV=energy_GeV)
+            run_mu_cache_ensemble(base_runner_cfg, fields, paths.cache_h5; energy_GeV=energy_GeV, time_reference=time_reference)
             verify_mu_cache_h5(paths.cache_h5)
         else
             error("Unknown cache mode: " * string(cfg[:cache_mode]))
@@ -1505,7 +1563,7 @@ function run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
     if !compute_analysis
         verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
         verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
-        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV)
+        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
         println("Transport analysis disabled; keeping verified cache file ", paths.cache_h5)
         return summary_row(
             energy_GeV,
@@ -1627,6 +1685,9 @@ function run_campaign(cfg)
             cfg[:trajectory_overrides],
             Dict{Symbol, Any}(
                 :file => cfg[:turbulence_h5],
+                :trajectory_mode => cfg[:mode_name],
+                :trajectory_field_source_path => cfg[:turbulence_h5],
+                :trajectory_field_source_identity => cfg[:turbulence_h5],
                 :mu_cache_output_precision => cfg[:mu_cache_output_precision],
             ),
         ),
@@ -1635,15 +1696,27 @@ function run_campaign(cfg)
     println("Campaign ", cfg[:campaign_tag])
     println("  campaign root            = ", cfg[:campaign_root])
     println("  turbulence H5            = ", cfg[:turbulence_h5])
+    println("  total reference H5       = ", cfg[:reference_h5])
     println("  cache mode               = ", cfg[:cache_mode])
+    println("Shared time reference:")
+    println("  source mode              = total")
+    println("  source file              = ", cfg[:reference_h5])
+    println("  definition               = mean |B_total| on loaded trajectory grid")
+    println("Trajectory mode:")
+    println("  mode                     = ", cfg[:mode_name])
+    println("  trajectory field file    = ", cfg[:turbulence_h5])
+    println("  time reference source    = total")
     println("Loading turbulence fields once for trajectory generation")
     fields = RunnerMod.load_static_fields(base_runner_cfg, base_runner_cfg[:precision])
+    reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => cfg[:reference_h5]))
+    println("Loading total-field reference once for time normalization")
+    reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
 
     summary_rows = Any[]
     summary_path = joinpath(cfg[:campaign_root], "campaign_summary.tsv")
     for energy_GeV in cfg[:energies]
         try
-            row = run_energy_pipeline!(cfg, fields, base_runner_cfg, energy_GeV)
+            row = run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
             push!(summary_rows, row)
             write_summary(summary_path, summary_rows)
             if cfg[:stop_on_error] && row.status == "error"
@@ -1687,6 +1760,8 @@ function materialize_campaign_cfg(cfg, campaign_spec)
         :campaign_tag => campaign_spec[:campaign_tag],
         :campaign_root => campaign_spec[:campaign_root],
         :turbulence_h5 => campaign_spec[:turbulence_h5],
+        :reference_h5 => campaign_spec[:reference_h5],
+        :mode_name => campaign_spec[:mode_name],
         :cache_mode => cfg[:cache_mode],
         :compute_dmumu => cfg[:compute_dmumu],
         :compute_dpp => cfg[:compute_dpp],
@@ -1875,6 +1950,44 @@ function reject_duplicate_time_controls(section, old_keys, new_keys, section_nam
     return nothing
 end
 
+function record_time_keys!(cfg, family::Symbol, source::Symbol, keys)
+    haskey(cfg, :explicit_time_keys) || (cfg[:explicit_time_keys] = Dict{Symbol, Dict{Symbol, Set{String}}}())
+    family_map = get!(cfg[:explicit_time_keys], family, Dict{Symbol, Set{String}}())
+    source_set = get!(family_map, source, Set{String}())
+    union!(source_set, String.(keys))
+    return nothing
+end
+
+function reject_recorded_time_conflicts(cfg)
+    haskey(cfg, :explicit_time_keys) || return nothing
+    pairs = Dict(
+        :trajectory_duration => (["tOmega0_max"], ["trajectory_duration_gyroperiods"]),
+        :integration_resolution => (["eta"], ["integration_steps_per_gyroperiod"]),
+        :trajectory_save_interval => (["trajectory_time_stride"], ["trajectory_save_interval_gyroperiods"]),
+        :dmumu_lag_min => (["min_lag_steps"], ["lag_min_gyroperiods"]),
+        :dmumu_lag_max => (["max_lag_steps"], ["lag_max_gyroperiods"]),
+        :dmumu_lag_stride => (["lag_step_stride"], ["lag_stride_gyroperiods"]),
+        :dpp_lag_min => (["min_lag_steps"], ["lag_min_gyroperiods"]),
+        :dpp_lag_max => (["max_lag_steps"], ["lag_max_gyroperiods"]),
+        :dpp_lag_stride => (["lag_step_stride"], ["lag_stride_gyroperiods"]),
+    )
+    for (family, (legacy, preferred)) in pairs
+        haskey(cfg[:explicit_time_keys], family) || continue
+        all_keys = String[]
+        sources = String[]
+        for (source, keys) in cfg[:explicit_time_keys][family]
+            append!(all_keys, collect(keys))
+            append!(sources, [string(source) * ":" * key for key in keys])
+        end
+        used_old = intersect(all_keys, legacy)
+        used_new = intersect(all_keys, preferred)
+        if !isempty(used_old) && !isempty(used_new)
+            error("Conflicting legacy and preferred time controls for " * string(family) * ": " * join(sources, ", ") * ". Use only " * join(preferred, ", ") * ".")
+        end
+    end
+    return nothing
+end
+
 function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
     key == :injection_position && return config_tuple3_floats(value, key_name)
@@ -1942,7 +2055,7 @@ end
 
 function apply_input_section!(cfg, input)
     legacy_keys = Set(["layout", "mode_decomposition_root", "mhd512_total_h5", "mhd512_mode_dir"])
-    generic_keys = Set(["h5_dir", "label", "medium", "file_stem", "total_file", "mode_file_pattern"])
+    generic_keys = Set(["h5_dir", "label", "medium", "file_stem", "total_file", "mode_file_pattern", "mode_decomposition_available", "available_modes"])
     allowed_keys = union(legacy_keys, generic_keys)
     validate_toml_keys(input, allowed_keys, "[input]")
 
@@ -1958,6 +2071,8 @@ function apply_input_section!(cfg, input)
         haskey(input, "file_stem") && (cfg[:input_spec][:file_stem] = strip(String(input["file_stem"])))
         haskey(input, "total_file") && (cfg[:input_spec][:total_file] = strip(String(input["total_file"])))
         haskey(input, "mode_file_pattern") && (cfg[:input_spec][:mode_file_pattern] = strip(String(input["mode_file_pattern"])))
+        haskey(input, "mode_decomposition_available") && (cfg[:mode_decomposition_available] = config_bool(input["mode_decomposition_available"], "[input].mode_decomposition_available"))
+        haskey(input, "available_modes") && (cfg[:available_modes] = config_available_modes(input["available_modes"], "[input].available_modes"))
         return nothing
     end
 
@@ -1972,6 +2087,9 @@ function apply_dmumu_section!(cfg, section)
     allowed_keys = union(Set(string(key) for key in keys(cfg[:dmumu_overrides])), Set(["particles"]))
     validate_toml_keys(section, allowed_keys, "[dmumu]")
     reject_duplicate_time_controls(section, ["min_lag_steps", "max_lag_steps", "lag_step_stride"], ["lag_min_gyroperiods", "lag_max_gyroperiods", "lag_stride_gyroperiods"], "[dmumu]", "lag_min_gyroperiods/lag_max_gyroperiods/lag_stride_gyroperiods")
+    record_time_keys!(cfg, :dmumu_lag_min, :toml, [key for key in ("min_lag_steps", "lag_min_gyroperiods") if haskey(section, key)])
+    record_time_keys!(cfg, :dmumu_lag_max, :toml, [key for key in ("max_lag_steps", "lag_max_gyroperiods") if haskey(section, key)])
+    record_time_keys!(cfg, :dmumu_lag_stride, :toml, [key for key in ("lag_step_stride", "lag_stride_gyroperiods") if haskey(section, key)])
 
     override_section = Dict{String, Any}(String(key) => value for (key, value) in section if String(key) != "particles")
     apply_override_section!(cfg[:dmumu_overrides], override_section, "[dmumu]")
@@ -1984,6 +2102,9 @@ function apply_dpp_section!(cfg, section)
     allowed_keys = Set(string(key) for key in keys(cfg[:dpp_overrides]))
     validate_toml_keys(section, allowed_keys, "[dpp]")
     reject_duplicate_time_controls(section, ["min_lag_steps", "max_lag_steps", "lag_step_stride"], ["lag_min_gyroperiods", "lag_max_gyroperiods", "lag_stride_gyroperiods"], "[dpp]", "lag_min_gyroperiods/lag_max_gyroperiods/lag_stride_gyroperiods")
+    record_time_keys!(cfg, :dpp_lag_min, :toml, [key for key in ("min_lag_steps", "lag_min_gyroperiods") if haskey(section, key)])
+    record_time_keys!(cfg, :dpp_lag_max, :toml, [key for key in ("max_lag_steps", "lag_max_gyroperiods") if haskey(section, key)])
+    record_time_keys!(cfg, :dpp_lag_stride, :toml, [key for key in ("lag_step_stride", "lag_stride_gyroperiods") if haskey(section, key)])
     apply_override_section!(cfg[:dpp_overrides], section, "[dpp]")
     return nothing
 end
@@ -1993,7 +2114,7 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     isfile(absolute_config_path) || error("Config file not found: " * absolute_config_path)
     config = TOML.parsefile(absolute_config_path)
 
-    validate_toml_keys(config, Set(["input", "output", "run", "particles", "dmumu", "dpp", "trajectory"]), "config")
+    validate_toml_keys(config, Set(["input", "output", "run", "particles", "dmumu", "dpp", "trajectory", "time_reference"]), "config")
 
     input = toml_section(config, "input")
     apply_input_section!(cfg, input)
@@ -2001,6 +2122,14 @@ function apply_toml_config!(cfg, config_path::AbstractString)
     output = toml_section(config, "output")
     validate_toml_keys(output, Set(["root"]), "[output]")
     haskey(output, "root") && (cfg[:output_root] = resolve_repo_path(output["root"]))
+
+    time_reference = toml_section(config, "time_reference")
+    validate_toml_keys(time_reference, Set(["mode"]), "[time_reference]")
+    if haskey(time_reference, "mode")
+        mode = replace(lowercase(strip(String(time_reference["mode"]))), "_" => "-")
+        mode == "total-field-mean-magnitude" || error("[time_reference].mode currently supports only total-field-mean-magnitude.")
+        cfg[:time_reference_mode] = mode
+    end
 
     run = toml_section(config, "run")
     validate_toml_keys(
@@ -2048,6 +2177,9 @@ function apply_toml_config!(cfg, config_path::AbstractString)
 
     trajectory_section = toml_section(config, "trajectory")
     particles_section = toml_section(config, "particles")
+    record_time_keys!(cfg, :trajectory_duration, :toml, [key for key in ("tOmega0_max", "trajectory_duration_gyroperiods") if haskey(trajectory_section, key) || haskey(particles_section, key)])
+    record_time_keys!(cfg, :integration_resolution, :toml, [key for key in ("eta", "integration_steps_per_gyroperiod") if haskey(trajectory_section, key) || haskey(particles_section, key)])
+    record_time_keys!(cfg, :trajectory_save_interval, :toml, [key for key in ("trajectory_time_stride", "trajectory_save_interval_gyroperiods") if haskey(trajectory_section, key) || haskey(particles_section, key)])
     reject_duplicate_time_controls(trajectory_section, ["tOmega0_max"], ["trajectory_duration_gyroperiods"], "[trajectory]", "trajectory_duration_gyroperiods")
     reject_duplicate_time_controls(trajectory_section, ["eta"], ["integration_steps_per_gyroperiod"], "[trajectory]", "integration_steps_per_gyroperiod")
     reject_duplicate_time_controls(trajectory_section, ["trajectory_time_stride"], ["trajectory_save_interval_gyroperiods"], "[trajectory]", "trajectory_save_interval_gyroperiods")
@@ -2086,6 +2218,7 @@ function runtime_config()
     cfg[:available_modes] = String.(MODE_NAMES)
     cfg[:dmumu_particles] = :sample
     cfg[:smoke] = false
+    cfg[:time_reference_mode] = "total-field-mean-magnitude"
 
     config_path = config_path_from_args(ARGS)
     cfg[:config_path] = config_path === nothing ? nothing : apply_toml_config!(cfg, config_path)
@@ -2239,28 +2372,37 @@ function runtime_config()
             cfg[:energies] = config_energy_values(split(argument, "=", limit=2)[2], "--energies")
         elseif startswith(argument, "--trajectory-duration-gyroperiods=")
             cfg[:trajectory_overrides][:trajectory_duration_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :trajectory_duration, :cli, ["trajectory_duration_gyroperiods"])
         elseif startswith(argument, "--integration-steps-per-gyroperiod=")
             cfg[:trajectory_overrides][:integration_steps_per_gyroperiod] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :integration_resolution, :cli, ["integration_steps_per_gyroperiod"])
         elseif startswith(argument, "--trajectory-save-interval-gyroperiods=")
             cfg[:trajectory_overrides][:trajectory_save_interval_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :trajectory_save_interval, :cli, ["trajectory_save_interval_gyroperiods"])
         elseif startswith(argument, "--dmumu-start-mode=")
             cfg[:dmumu_overrides][:dmumu_start_mode] = CombinedFullMod.parse_dmumu_start_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-lag-min-gyroperiods=")
             cfg[:dmumu_overrides][:lag_min_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dmumu_lag_min, :cli, ["lag_min_gyroperiods"])
         elseif startswith(argument, "--dmumu-lag-max-gyroperiods=")
             cfg[:dmumu_overrides][:lag_max_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dmumu_lag_max, :cli, ["lag_max_gyroperiods"])
         elseif startswith(argument, "--dmumu-lag-stride-gyroperiods=")
             cfg[:dmumu_overrides][:lag_stride_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dmumu_lag_stride, :cli, ["lag_stride_gyroperiods"])
         elseif startswith(argument, "--dmumu-min-lag-steps=")
             cfg[:dmumu_overrides][:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dmumu_lag_min, :cli, ["min_lag_steps"])
         elseif startswith(argument, "--dmumu-lag-mode=")
             cfg[:dmumu_overrides][:lag_mode] = CombinedFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-n-lag-samples=")
             cfg[:dmumu_overrides][:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-lag-step-stride=")
             cfg[:dmumu_overrides][:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dmumu_lag_stride, :cli, ["lag_step_stride"])
         elseif startswith(argument, "--dmumu-max-lag-steps=")
             cfg[:dmumu_overrides][:max_lag_steps] = config_maybe_int(split(argument, "=", limit=2)[2], "--dmumu-max-lag-steps")
+            record_time_keys!(cfg, :dmumu_lag_max, :cli, ["max_lag_steps"])
         elseif startswith(argument, "--dmumu-particle-chunk-size=")
             cfg[:dmumu_overrides][:particle_chunk_size] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-first-particle=")
@@ -2287,20 +2429,26 @@ function runtime_config()
             cfg[:dmumu_overrides][:mu_max] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-lag-min-gyroperiods=")
             cfg[:dpp_overrides][:lag_min_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dpp_lag_min, :cli, ["lag_min_gyroperiods"])
         elseif startswith(argument, "--dpp-lag-max-gyroperiods=")
             cfg[:dpp_overrides][:lag_max_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dpp_lag_max, :cli, ["lag_max_gyroperiods"])
         elseif startswith(argument, "--dpp-lag-stride-gyroperiods=")
             cfg[:dpp_overrides][:lag_stride_gyroperiods] = parse(Float64, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dpp_lag_stride, :cli, ["lag_stride_gyroperiods"])
         elseif startswith(argument, "--dpp-min-lag-steps=")
             cfg[:dpp_overrides][:min_lag_steps] = parse(Int, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dpp_lag_min, :cli, ["min_lag_steps"])
         elseif startswith(argument, "--dpp-lag-mode=")
             cfg[:dpp_overrides][:lag_mode] = DppFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-n-lag-samples=")
             cfg[:dpp_overrides][:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-lag-step-stride=")
             cfg[:dpp_overrides][:lag_step_stride] = parse(Int, split(argument, "=", limit=2)[2])
+            record_time_keys!(cfg, :dpp_lag_stride, :cli, ["lag_step_stride"])
         elseif startswith(argument, "--dpp-max-lag-steps=")
             cfg[:dpp_overrides][:max_lag_steps] = config_maybe_int(split(argument, "=", limit=2)[2], "--dpp-max-lag-steps")
+            record_time_keys!(cfg, :dpp_lag_max, :cli, ["max_lag_steps"])
         elseif startswith(argument, "--dpp-particle-chunk-size=")
             cfg[:dpp_overrides][:particle_chunk_size] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-first-particle=")
@@ -2318,6 +2466,7 @@ function runtime_config()
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)
+    reject_recorded_time_conflicts(cfg)
 
     if any(argument -> argument == "--keep-trajectories", ARGS) || any(argument -> argument == "--keep-caches", ARGS)
         cfg[:delete_cache_on_success] = false

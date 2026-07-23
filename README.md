@@ -68,9 +68,14 @@ The current public config layout is:
 
 - `[input]`
   - `h5_dir`: directory containing the input HDF5 files.
+  - `total_file`: required total-field HDF5 file. This file is always used to
+    define the shared reference clock and is also the trajectory field for the
+    `total` campaign.
   - `label`: user label for this dataset, for example `0_5` or `512_a_00100`.
   - `medium`: `iso` or `mp`. This is reflected in output paths.
-  - `file_stem`, `mode_file_pattern`, and optional `total_file`: file naming.
+  - `file_stem`, `mode_decomposition_available`, `available_modes`, and
+    `mode_file_pattern`: optional mode-file discovery. If mode decomposition is
+    disabled, only `total_file` is transported.
 
 - `[run]`
   - `cache_mode`: `phase-space` records positions and momenta; `mu` writes a
@@ -120,8 +125,33 @@ The current public config layout is:
     `scripts/plot_energy_distribution.py` after each campaign to build
     campaign-level energy-distribution figures.
 
-Legacy `[input].layout` configs for `mp-weakb` and `mhd512` are still accepted,
-but new configs should use the generic `[input]` form.
+Legacy `[input].layout` configs are retained only where a total-field reference
+file can be resolved. New configs should use the generic `[input]` form with an
+explicit `total_file`.
+
+## Shared Reference Clock For Mode Decomposition
+
+For decomposed campaigns, total, Alfven, fast, and slow trajectories use
+different Lorentz-force fields but the same reference clock. The reference is
+always derived from the total-field file:
+
+```text
+B0_reference_T = mean(|B_total|)
+Omega0_reference_s_inv = q_e * B0_reference_T / (gamma0 * m_p)
+T_g0 = 2π / Omega0_reference_s_inv
+```
+
+The reference depends on energy through `gamma0`, but not on trajectory mode. A
+selected-mode-only run such as `modes = ["alfven", "fast"]` still loads
+`total_file` to resolve `B0_reference_T`; it does not require a completed total
+trajectory run. If `total_file` is missing, the run stops before trajectory
+generation.
+
+Primary cached analysis arrays are uniformly sampled. If the exact integration
+end does not fall on the requested cache cadence, that off-cadence final sample
+is not appended to `/positions`, `/momenta`, `/mu`, or the time axes used by
+transport estimators. Requested physical lags outside the representable cached
+range are rejected rather than clamped to a boundary.
 
 ## Time Conventions
 

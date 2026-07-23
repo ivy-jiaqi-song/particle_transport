@@ -131,3 +131,30 @@ end
     @test ref.time_reference_source_path == "total.h5"
     @test ref.reference_gyroperiod_s ≈ pi
 end
+
+@testset "direct runner reference guard" begin
+    ref = campaign_time_reference(5.0, 2.0; source_mode="total", source_path="total.h5")
+    @test require_explicit_campaign_time_reference("total", ref; caller="test") === ref
+    for mode in ("alfven", "fast", "slow", "unknown", "total")
+        @test_throws ErrorException require_explicit_campaign_time_reference(mode, nothing; caller="test")
+    end
+end
+
+@testset "structured time validation" begin
+    t_gp = [0.0, 0.25, 0.5, 0.75, 0.85]
+    t_norm = 2.0 .* pi .* t_gp
+    t_s = t_norm ./ 4.0
+    result = validate_time_axes_result(t_s, t_norm, t_gp; require_uniform=true)
+    @test !result.valid
+    @test result.reason == :nonuniform_time_axis
+
+    bad_norm = copy(t_norm)
+    bad_norm[end] += 0.1
+    result = validate_time_axes_result(t_s, bad_norm, t_gp; require_uniform=true)
+    @test !result.valid
+    @test result.reason == :inconsistent_time_units
+
+    result = validate_time_axes_result(t_s[1:end-1], t_norm, t_gp; require_uniform=true)
+    @test !result.valid
+    @test result.reason == :time_length_mismatch
+end

@@ -816,6 +816,8 @@ function save_combined_full_h5(
         file["turbulence_h5"] = string(cfg[:turbulence_h5])
         file["compute_backend"] = string(backend)
         file["compute_precision"] = string(cfg[:compute_precision])
+        file["source_cache_uniform_time_axis"] = true
+        file["source_cache_identity"] = string(cfg[:trajectory_h5])
         file["particle_chunk_size"] = Int(cfg[:particle_chunk_size])
         file["first_particle"] = Int(first_particle)
         file["last_particle"] = Int(last_particle)
@@ -833,6 +835,10 @@ function save_combined_full_h5(
         file["min_lag_steps"] = Int(get(cfg, :min_lag_steps, 1))
         file["lag_step_stride"] = Int(cfg[:lag_step_stride])
         file["max_lag_steps"] = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
+        if lag_grid !== nothing
+            file["source_cache_analysis_sample_count"] = Int[round(Int, lag_grid.cache_lag_max_gyroperiods / lag_grid.cache_save_interval_gyroperiods) + 1]
+            file["source_cache_save_interval_gyroperiods"] = Float64[lag_grid.cache_save_interval_gyroperiods]
+        end
         file["min_count_per_cell"] = Int(cfg[:min_count_per_cell])
         file["box_length_pc"] = Float64(cfg[:box_length_pc])
         file["field_subset"] = cfg[:field_subset] === nothing ? "nothing" : string(cfg[:field_subset])
@@ -1027,7 +1033,7 @@ function run_combined_full(cfg)
         t_norm = Float64.(read(trajectory_file["t_norm"]))
         t_gyroperiods = haskey(trajectory_file, "t_gyroperiods") ? Float64.(read(trajectory_file["t_gyroperiods"])) : t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = validate_trajectory_layout(positions_dataset, momenta_dataset, t_s, t_norm)
-        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Trajectory HDF5 time axes", require_uniform=true)
+        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Trajectory HDF5 time axes in " * string(cfg[:trajectory_h5]), require_uniform=true)
         total_particles = size(positions_dataset, 1)
 
         particle_indices = build_particle_indices(total_particles, cfg)

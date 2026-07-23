@@ -333,6 +333,8 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         file["trajectory_h5"] = string(cfg[:trajectory_h5])
         file["cache_h5"] = string(get(cfg, :cache_h5, cfg[:trajectory_h5]))
         file["cache_mode"] = "phase_space"
+        file["source_cache_uniform_time_axis"] = true
+        file["source_cache_identity"] = string(get(cfg, :cache_h5, cfg[:trajectory_h5]))
         file["particle_chunk_size"] = Int(cfg[:particle_chunk_size])
         file["first_particle"] = Int(first_particle)
         file["last_particle"] = Int(last_particle)
@@ -350,6 +352,10 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         file["min_lag_steps"] = Int(get(cfg, :min_lag_steps, 1))
         file["lag_step_stride"] = Int(cfg[:lag_step_stride])
         file["max_lag_steps"] = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
+        if lag_grid !== nothing
+            file["source_cache_analysis_sample_count"] = Int[round(Int, lag_grid.cache_lag_max_gyroperiods / lag_grid.cache_save_interval_gyroperiods) + 1]
+            file["source_cache_save_interval_gyroperiods"] = Float64[lag_grid.cache_save_interval_gyroperiods]
+        end
         file["dpp_note"] = "Global scalar momentum diffusion uses p = sqrt(px^2 + py^2 + pz^2) and Delta p = p(t + tau) - p(t). Normalized D_pp uses Delta p / p0 and tau * Omega0."
         copy_cache_metadata!(file, get(cfg, :cache_h5, cfg[:trajectory_h5]))
         dpp_group = create_group(file, "dpp")
@@ -428,7 +434,7 @@ function run_dpp_full(cfg)
         t_norm = Float64.(read(trajectory_file["t_norm"]))
         t_gyroperiods = haskey(trajectory_file, "t_gyroperiods") ? Float64.(read(trajectory_file["t_gyroperiods"])) : t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = validate_phase_space_layout(momenta_dataset, t_s, t_norm)
-        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="D_pp trajectory time axes", require_uniform=true)
+        validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="D_pp trajectory time axes in " * string(cfg[:trajectory_h5]), require_uniform=true)
         total_particles = size(momenta_dataset, 1)
         particle_indices = build_particle_indices(total_particles, cfg)
         first_particle = first(particle_indices)

@@ -41,6 +41,12 @@ function campaign_time_reference(B0_reference_T::Real, Omega0_reference_s_inv::R
     )
 end
 
+function require_explicit_campaign_time_reference(trajectory_mode, time_reference; caller::AbstractString="trajectory runner")
+    time_reference !== nothing && return time_reference
+    mode = lowercase(string(trajectory_mode))
+    error("Trajectory mode '" * mode * "' requires an explicit campaign time reference derived from the total-field dataset. The " * caller * " must not derive B0_reference from the trajectory field. Use a total-field wrapper for standalone total-field runs.")
+end
+
 function resolve_eta_requested(cfg)
     if haskey(cfg, :integration_steps_per_gyroperiod) && cfg[:integration_steps_per_gyroperiod] !== nothing
         steps_per_gyroperiod = assert_finite_positive(cfg[:integration_steps_per_gyroperiod], "integration_steps_per_gyroperiod")
@@ -157,9 +163,34 @@ function validate_time_axes(t_s, t_norm, t_gyroperiods; key_name::AbstractString
     if require_uniform
         intervals = diff(Float64.(t_gyroperiods))
         save_interval = first(intervals)
-        all(abs.(intervals .- save_interval) .<= Float64(atol) .+ Float64(rtol) .* abs(save_interval)) || error(key_name * ": saved analysis time axis is not uniformly spaced; regenerate the cache or use a uniform legacy prefix.")
+        all(abs.(intervals .- save_interval) .<= Float64(atol) .+ Float64(rtol) .* abs(save_interval)) || error(nonuniform_time_axis_message(key_name, intervals, save_interval))
     end
     return n
+end
+
+function nonuniform_time_axis_message(key_name::AbstractString, intervals, expected_interval)
+    diffs = abs.(Float64.(intervals) .- Float64(expected_interval))
+    first_bad = findfirst(index -> diffs[index] > 1.0e-12 + 1.0e-10 * abs(Float64(expected_interval)), eachindex(diffs))
+    first_bad === nothing && (first_bad = 1)
+    return key_name * ": nonuniform primary time axis; fixed-index lag analysis is unsafe. Likely cause: an older cache appended an off-cadence final trajectory state. Required action: regenerate the trajectory cache with the current pipeline, then rerun transport analysis. Expected interval: $(expected_interval) reference gyroperiods. First irregular interval index: $(first_bad). Observed interval: $(intervals[first_bad]) reference gyroperiods."
+end
+
+function validate_time_axes_result(t_s, t_norm, t_gyroperiods; key_name::AbstractString="time axes", require_uniform::Bool=true, rtol::Real=1.0e-10, atol::Real=1.0e-12)
+    n = length(t_s)
+    length(t_norm) == n || return (valid=false, reason=:time_length_mismatch, message=key_name * ": t_norm length does not match t_s.")
+    length(t_gyroperiods) == n || return (valid=false, reason=:time_length_mismatch, message=key_name * ": t_gyroperiods length does not match t_s.")
+    n > 1 || return (valid=false, reason=:time_length_mismatch, message=key_name * ": need at least two time samples.")
+    (all(isfinite, t_s) && all(isfinite, t_norm) && all(isfinite, t_gyroperiods)) || return (valid=false, reason=:inconsistent_time_units, message=key_name * ": time axes contain non-finite values.")
+    (all(diff(Float64.(t_s)) .> 0.0) && all(diff(Float64.(t_norm)) .> 0.0) && all(diff(Float64.(t_gyroperiods)) .> 0.0)) || return (valid=false, reason=:inconsistent_time_units, message=key_name * ": time axes must be strictly increasing.")
+    all(isapprox.(Float64.(t_norm) ./ (2.0 * pi), Float64.(t_gyroperiods); rtol=rtol, atol=atol)) || return (valid=false, reason=:inconsistent_time_units, message=key_name * ": t_norm and t_gyroperiods are inconsistent.")
+    if require_uniform
+        intervals = diff(Float64.(t_gyroperiods))
+        save_interval = first(intervals)
+        if !all(abs.(intervals .- save_interval) .<= Float64(atol) .+ Float64(rtol) .* abs(save_interval))
+            return (valid=false, reason=:nonuniform_time_axis, message=nonuniform_time_axis_message(key_name, intervals, save_interval))
+        end
+    end
+    return (valid=true, reason=:ok, message="ok")
 end
 
 function uniform_prefix_length(t_gyroperiods; rtol::Real=1.0e-10, atol::Real=1.0e-12)

@@ -153,6 +153,20 @@ is not appended to `/positions`, `/momenta`, `/mu`, or the time axes used by
 transport estimators. Requested physical lags outside the representable cached
 range are rejected rather than clamped to a boundary.
 
+## Legacy Cache Compatibility
+
+Transport analysis requires a uniformly sampled trajectory cache because integer
+lag offsets are assumed to correspond to fixed physical time separations. Older
+caches that contain an appended off-cadence final sample are not repaired,
+trimmed, or partially consumed. They are invalid for fixed-index D_mumu and D_pp
+analysis and must be regenerated with the current pipeline. The exact final
+integration state may be stored separately in future cache layouts, but it is not
+part of the primary transport-analysis time series.
+
+Low-level decomposed trajectory runs also require an explicit campaign time
+reference derived from the total-field dataset. Only the total-field convenience
+wrapper may derive the reference clock from its own field.
+
 ## Time Conventions
 
 User-facing trajectory and lag controls are expressed in reference gyroperiods.

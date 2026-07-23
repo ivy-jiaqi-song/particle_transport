@@ -34,6 +34,8 @@ const CFG = Dict{Symbol, Any}(
     :precision => Float64,
     :field_subset => nothing,
     :boundary => :periodic,   # :open or :periodic
+    :trajectory_mode => :total,
+    :time_reference_mode => TIME_REFERENCE_MODE,
     :injection_mode => :isotropic,
     :injection_mu0 => 0.0,
     :injection_position_mode => :random,
@@ -449,7 +451,29 @@ function output_paths(cfg, E)
     return (h5 = joinpath(outdir, "phase_space_" * tag * ".h5"), label = "E = " * string(Int(E)) * " GeV")
 end
 
-function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference=nothing)
+function trajectory_mode_name(cfg)
+    return lowercase(string(get(cfg, :trajectory_mode, "unknown")))
+end
+
+function resolve_total_field_time_reference(cfg, fields; energy_GeV)
+    mode = trajectory_mode_name(cfg)
+    mode == "total" || error("Trajectory mode '" * mode * "' requires an explicit campaign time reference derived from the total-field dataset. The low-level runner must not derive B0_reference from a decomposed or unknown field.")
+    reference_mode = replace(lowercase(string(get(cfg, :time_reference_mode, TIME_REFERENCE_MODE))), "_" => "-")
+    reference_mode == TIME_REFERENCE_MODE || error("Standalone total-field reference supports only " * TIME_REFERENCE_MODE * ".")
+    T = cfg[:precision]
+    Bx, By, Bz = fields[1], fields[2], fields[3]
+    B0 = reference_B0_T(Bx, By, Bz)
+    gamma0 = energy_to_gamma(energy_GeV, T)
+    Omega0_value = reference_Omega0(B0, gamma0, Q_E, M_P)
+    source_path = string(get(cfg, :trajectory_field_source_path, cfg[:file]))
+    return campaign_time_reference(B0, Omega0_value; source_mode="total", source_path=source_path, source_identity=string(get(cfg, :trajectory_field_source_identity, source_path)), field_subset=get(cfg, :field_subset, nothing))
+end
+
+function require_time_reference(cfg, time_reference)
+    return require_explicit_campaign_time_reference(trajectory_mode_name(cfg), time_reference; caller="low-level runner")
+end
+
+function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference)
     T = cfg[:precision]
     Bx, By, Bz, vx, vy, vz = fields
     nx, ny, nz = size(Bx)
@@ -464,11 +488,7 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference=nothing)
     trajectory_out_type = cfg[:trajectory_output_precision]
 
     gamma0 = energy_to_gamma(energy_GeV, T)
-    if time_reference === nothing
-        B0 = reference_B0_T(Bx, By, Bz)
-        Omega0_value = reference_Omega0(B0, gamma0, Q_E, M_P)
-        time_reference = campaign_time_reference(B0, Omega0_value; source_mode="trajectory", source_path=String(cfg[:file]), source_identity=String(cfg[:file]), field_subset=get(cfg, :field_subset, nothing))
-    end
+    time_reference = require_time_reference(cfg, time_reference)
     Omega0 = T(time_reference.Omega0_reference_s_inv)
     v0 = energy_to_speed(energy_GeV, T)
     trajectory_time = resolve_trajectory_time_grid(cfg, Omega0, v0, estimate_min_dx(x, y, z))
@@ -612,6 +632,12 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference=nothing)
     )
 end
 
+function run_total_field_gpu_ensemble(cfg, fields; energy_GeV)
+    total_cfg = merge(cfg, Dict{Symbol, Any}(:trajectory_mode => :total))
+    time_reference = resolve_total_field_time_reference(total_cfg, fields; energy_GeV=energy_GeV)
+    return run_gpu_ensemble(total_cfg, fields; energy_GeV=energy_GeV, time_reference=time_reference)
+end
+
 function main()
     mkpath(CFG[:output_dir])
     fields = load_static_fields(CFG, CFG[:precision])
@@ -625,7 +651,7 @@ function main()
     println("  field_subset   = ", CFG[:field_subset])
 
     for E in CFG[:energies]
-        res = run_gpu_ensemble(CFG, fields; energy_GeV=E)
+        res = run_total_field_gpu_ensemble(CFG, fields; energy_GeV=E)
         println("Completed energy ", E, " GeV")
         println("  dt [s]         = ", res.dt)
         println("  Omega0 [1/s]   = ", res.Omega0)

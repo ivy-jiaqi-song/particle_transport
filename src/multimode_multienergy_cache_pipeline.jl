@@ -465,51 +465,70 @@ function verify_file_nonempty(path)
     error("Missing file path for verification: " * string(path))
 end
 
-function verify_phase_space_cache_h5(path_h5::AbstractString)
-    verify_file_nonempty(path_h5)
-    h5open(path_h5, "r") do file
-        positions = file["positions"]
-        momenta = file["momenta"]
-        t_s = read(file["t_s"])
-        t_norm = read(file["t_norm"])
-        t_gyroperiods = haskey(file, "t_gyroperiods") ? read(file["t_gyroperiods"]) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
-        alive_fraction = read(file["alive_fraction"])
-        size(positions) == size(momenta) || error("Phase-space verification failed: positions/momenta shapes differ for " * path_h5)
-        nsteps = size(positions, 3)
-        length(t_s) == nsteps || error("Phase-space verification failed: t_s length mismatch for " * path_h5)
-        length(t_norm) == nsteps || error("Phase-space verification failed: t_norm length mismatch for " * path_h5)
-        length(t_gyroperiods) == nsteps || error("Phase-space verification failed: t_gyroperiods length mismatch for " * path_h5)
-        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Phase-space cache time axes", require_uniform=true)
-        length(alive_fraction) == nsteps || error("Phase-space verification failed: alive_fraction length mismatch for " * path_h5)
-        nsteps > 1 || error("Phase-space verification failed: not enough saved steps in " * path_h5)
+invalid_cache_result(reason::Symbol, message::AbstractString) = (valid=false, reason=reason, message=String(message))
+ok_cache_result() = (valid=true, reason=:ok, message="ok")
+
+function validate_phase_space_cache_h5(path_h5::AbstractString)
+    try
+        verify_file_nonempty(path_h5)
+        h5open(path_h5, "r") do file
+            positions = file["positions"]
+            momenta = file["momenta"]
+            t_s = read(file["t_s"])
+            t_norm = read(file["t_norm"])
+            t_gyroperiods = haskey(file, "t_gyroperiods") ? read(file["t_gyroperiods"]) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
+            alive_fraction = read(file["alive_fraction"])
+            size(positions) == size(momenta) || return invalid_cache_result(:time_length_mismatch, "Phase-space verification failed: positions/momenta shapes differ for " * path_h5)
+            nsteps = size(positions, 3)
+            length(t_s) == nsteps || return invalid_cache_result(:time_length_mismatch, "Phase-space verification failed: t_s length mismatch for " * path_h5)
+            length(t_norm) == nsteps || return invalid_cache_result(:time_length_mismatch, "Phase-space verification failed: t_norm length mismatch for " * path_h5)
+            length(t_gyroperiods) == nsteps || return invalid_cache_result(:time_length_mismatch, "Phase-space verification failed: t_gyroperiods length mismatch for " * path_h5)
+            axes_result = RunnerMod.validate_time_axes_result(t_s, t_norm, t_gyroperiods; key_name="Phase-space cache time axes", require_uniform=true)
+            axes_result.valid || return axes_result
+            length(alive_fraction) == nsteps || return invalid_cache_result(:time_length_mismatch, "Phase-space verification failed: alive_fraction length mismatch for " * path_h5)
+            nsteps > 1 || return invalid_cache_result(:time_length_mismatch, "Phase-space verification failed: not enough saved steps in " * path_h5)
+            return ok_cache_result()
+        end
+    catch error_instance
+        return invalid_cache_result(:legacy_metadata_missing, sprint(showerror, error_instance))
     end
-    return true
 end
 
-function verify_mu_cache_h5(path_h5::AbstractString)
-    verify_file_nonempty(path_h5)
-    h5open(path_h5, "r") do file
-        mu = file["mu"]
-        t_s = read(file["t_s"])
-        t_norm = read(file["t_norm"])
-        t_gyroperiods = haskey(file, "t_gyroperiods") ? read(file["t_gyroperiods"]) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
-        alive_fraction = read(file["alive_fraction"])
-        nsteps = size(mu, 2)
-        length(t_s) == nsteps || error("Mu-cache verification failed: t_s length mismatch for " * path_h5)
-        length(t_norm) == nsteps || error("Mu-cache verification failed: t_norm length mismatch for " * path_h5)
-        length(t_gyroperiods) == nsteps || error("Mu-cache verification failed: t_gyroperiods length mismatch for " * path_h5)
-        RunnerMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes", require_uniform=true)
-        length(alive_fraction) == nsteps || error("Mu-cache verification failed: alive_fraction length mismatch for " * path_h5)
-        size(mu, 1) > 0 || error("Mu-cache verification failed: zero particles in " * path_h5)
-        nsteps > 1 || error("Mu-cache verification failed: not enough saved steps in " * path_h5)
+function validate_mu_cache_h5(path_h5::AbstractString)
+    try
+        verify_file_nonempty(path_h5)
+        h5open(path_h5, "r") do file
+            mu = file["mu"]
+            t_s = read(file["t_s"])
+            t_norm = read(file["t_norm"])
+            t_gyroperiods = haskey(file, "t_gyroperiods") ? read(file["t_gyroperiods"]) : RunnerMod.t_gyroperiods_from_axes(t_s, t_norm)
+            alive_fraction = read(file["alive_fraction"])
+            nsteps = size(mu, 2)
+            length(t_s) == nsteps || return invalid_cache_result(:time_length_mismatch, "Mu-cache verification failed: t_s length mismatch for " * path_h5)
+            length(t_norm) == nsteps || return invalid_cache_result(:time_length_mismatch, "Mu-cache verification failed: t_norm length mismatch for " * path_h5)
+            length(t_gyroperiods) == nsteps || return invalid_cache_result(:time_length_mismatch, "Mu-cache verification failed: t_gyroperiods length mismatch for " * path_h5)
+            axes_result = RunnerMod.validate_time_axes_result(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes", require_uniform=true)
+            axes_result.valid || return axes_result
+            length(alive_fraction) == nsteps || return invalid_cache_result(:time_length_mismatch, "Mu-cache verification failed: alive_fraction length mismatch for " * path_h5)
+            size(mu, 1) > 0 || return invalid_cache_result(:time_length_mismatch, "Mu-cache verification failed: zero particles in " * path_h5)
+            nsteps > 1 || return invalid_cache_result(:time_length_mismatch, "Mu-cache verification failed: not enough saved steps in " * path_h5)
+            return ok_cache_result()
+        end
+    catch error_instance
+        return invalid_cache_result(:legacy_metadata_missing, sprint(showerror, error_instance))
     end
-    return true
+end
+
+function validate_cache_h5(path_h5::AbstractString, cache_mode::Symbol)
+    cache_mode == :phase_space && return validate_phase_space_cache_h5(path_h5)
+    cache_mode == :mu && return validate_mu_cache_h5(path_h5)
+    error("Unknown cache mode: " * string(cache_mode))
 end
 
 function verify_cache_h5(path_h5::AbstractString, cache_mode::Symbol)
-    cache_mode == :phase_space && return verify_phase_space_cache_h5(path_h5)
-    cache_mode == :mu && return verify_mu_cache_h5(path_h5)
-    error("Unknown cache mode: " * string(cache_mode))
+    result = validate_cache_h5(path_h5, cache_mode)
+    result.valid || error(result.message)
+    return true
 end
 
 function requested_default_injection(cfg)
@@ -761,6 +780,9 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
         if !(haskey(file, "delta_mu2") && haskey(file, "dmumu"))
             return false
         end
+        h5_scalar_bool_or(file, "source_cache_uniform_time_axis", false) || return false
+        haskey(file, "source_cache_analysis_sample_count") || return false
+        haskey(file, "source_cache_save_interval_gyroperiods") || return false
         stored_start_mode = CombinedFullMod.parse_dmumu_start_mode(h5_scalar_string_or(file, "dmumu_start_mode", "sliding"))
         stored_mu_bin_abs = h5_scalar_bool_or(file, "mu_bin_abs", false)
         stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
@@ -796,6 +818,9 @@ end
 function dpp_outputs_match_requested(path_h5::AbstractString, cfg)
     h5open(path_h5, "r") do file
         haskey(file, "dpp") && haskey(file, "energy_snapshots") || return false
+        h5_scalar_bool_or(file, "source_cache_uniform_time_axis", false) || return false
+        haskey(file, "source_cache_analysis_sample_count") || return false
+        haskey(file, "source_cache_save_interval_gyroperiods") || return false
         stored_lag_mode = DppFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
         stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
         stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
@@ -995,7 +1020,11 @@ function reconstruct_mu_step_kernel!(mu_step, x1_step, x2_step, x3_step, p1_step
     return
 end
 
-function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_GeV, time_reference=nothing)
+function require_mu_cache_time_reference(cfg, time_reference)
+    return RunnerMod.require_explicit_campaign_time_reference(RunnerMod.trajectory_mode_name(cfg), time_reference; caller="compact mu cache runner")
+end
+
+function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_GeV, time_reference)
     T = cfg[:precision]
     Bx, By, Bz, vx, vy, vz = fields
     nx, ny, nz = size(Bx)
@@ -1010,11 +1039,7 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     cache_out_type = cfg[:mu_cache_output_precision]
 
     gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
-    if time_reference === nothing
-        B0 = RunnerMod.reference_B0_T(Bx, By, Bz)
-        Omega0_value = RunnerMod.reference_Omega0(B0, gamma0, RunnerMod.Q_E, RunnerMod.M_P)
-        time_reference = RunnerMod.campaign_time_reference(B0, Omega0_value; source_mode="trajectory", source_path=String(cfg[:file]), source_identity=String(cfg[:file]), field_subset=get(cfg, :field_subset, nothing))
-    end
+    time_reference = require_mu_cache_time_reference(cfg, time_reference)
     Omega0 = T(time_reference.Omega0_reference_s_inv)
     v0 = RunnerMod.energy_to_speed(energy_GeV, T)
     trajectory_time = RunnerMod.resolve_trajectory_time_grid(cfg, Omega0, v0, RunnerMod.estimate_min_dx(x, y, z))
@@ -1156,6 +1181,12 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     )
 end
 
+function run_total_field_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_GeV)
+    total_cfg = merge(cfg, Dict{Symbol, Any}(:trajectory_mode => :total))
+    time_reference = RunnerMod.resolve_total_field_time_reference(total_cfg, fields; energy_GeV=energy_GeV)
+    return run_mu_cache_ensemble(total_cfg, fields, output_h5; energy_GeV=energy_GeV, time_reference=time_reference)
+end
+
 function read_mu_batch(dataset, particle_indices)
     isempty(particle_indices) && error("Cannot read an empty mu batch.")
     if CombinedFullMod.is_contiguous(particle_indices)
@@ -1266,7 +1297,7 @@ function run_combined_from_mu_cache(cfg)
         t_norm = Float64.(read(cache_file["t_norm"]))
         t_gyroperiods = haskey(cache_file, "t_gyroperiods") ? Float64.(read(cache_file["t_gyroperiods"])) : CombinedFullMod.t_gyroperiods_from_axes(t_s, t_norm)
         nsteps = size(mu_dataset, 2)
-        CombinedFullMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes", require_uniform=true)
+        CombinedFullMod.validate_time_axes(t_s, t_norm, t_gyroperiods; key_name="Mu-cache time axes in " * string(cfg[:cache_h5]), require_uniform=true)
         total_particles = size(mu_dataset, 1)
 
         particle_indices = CombinedFullMod.build_particle_indices(total_particles, cfg)
@@ -1487,27 +1518,41 @@ function run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, en
     compute_analysis = cfg[:compute_dmumu] || cfg[:compute_dpp]
 
     if !compute_analysis && cfg[:skip_completed_outputs] && isfile(paths.cache_h5)
-        verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
-        verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
-        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
-        println("Cache already verified; transport analysis disabled for energy ", energy_GeV, " GeV")
-        return summary_row(
-            energy_GeV,
-            "skipped_existing_cache",
-            false,
-            paths.cache_h5,
-            "",
-            "",
-            "disabled",
-            "disabled",
-            "",
-            "",
-            "verified existing cache; transport analysis disabled",
-        )
+        validation = validate_cache_h5(paths.cache_h5, cfg[:cache_mode])
+        if validation.valid
+            verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
+            verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
+            println("Cache already verified; transport analysis disabled for energy ", energy_GeV, " GeV")
+            return summary_row(
+                energy_GeV,
+                "skipped_existing_cache",
+                false,
+                paths.cache_h5,
+                "",
+                "",
+                "disabled",
+                "disabled",
+                "",
+                "",
+                "verified existing cache; transport analysis disabled",
+            )
+        elseif validation.reason == :nonuniform_time_axis
+            println("Existing cache is incompatible with fixed-index transport analysis and will be regenerated.")
+            println(validation.message)
+        else
+            error(validation.message)
+        end
     end
 
     dmumu_complete = !cfg[:compute_dmumu] || (cfg[:skip_completed_outputs] && dmumu_outputs_complete(paths, requested_dmumu_cfg))
     dpp_complete = !cfg[:compute_dpp] || (cfg[:skip_completed_outputs] && dpp_outputs_complete(paths, requested_dpp_cfg))
+    if isfile(paths.cache_h5)
+        cache_validation_for_outputs = validate_cache_h5(paths.cache_h5, cfg[:cache_mode])
+        if !cache_validation_for_outputs.valid
+            dmumu_complete = !cfg[:compute_dmumu]
+            dpp_complete = !cfg[:compute_dpp]
+        end
+    end
     dmumu_status = requested_status(cfg[:compute_dmumu], dmumu_complete)
     dpp_status = requested_status(cfg[:compute_dpp], dpp_complete)
     dmumu_note = dmumu_status == "skipped_existing" ? "verified existing D_mumu outputs" : ""
@@ -1539,22 +1584,34 @@ function run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, en
         )
     end
 
+    existing_cache_reusable = false
     if cfg[:reuse_existing_cache] && isfile(paths.cache_h5)
         println("Reusing existing cache file ", paths.cache_h5)
-        verify_cache_h5(paths.cache_h5, cfg[:cache_mode])
-        verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
-        verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
-    else
+        validation = validate_cache_h5(paths.cache_h5, cfg[:cache_mode])
+        if validation.valid
+            verify_cache_injection_metadata(paths.cache_h5, base_runner_cfg)
+            verify_cache_time_metadata(paths.cache_h5, base_runner_cfg, fields, energy_GeV, time_reference)
+            existing_cache_reusable = true
+        elseif validation.reason == :nonuniform_time_axis
+            println("Existing cache is incompatible with fixed-index transport analysis and will be regenerated.")
+            println(validation.message)
+            existing_cache_reusable = false
+        else
+            error(validation.message)
+        end
+    end
+
+    if !existing_cache_reusable
         if cfg[:cache_mode] == :phase_space
             runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(
                 :output_dir => paths.cache_dir,
                 :energies => [energy_GeV],
             ))
             runner_result = RunnerMod.run_gpu_ensemble(runner_cfg, fields; energy_GeV=energy_GeV, time_reference=time_reference)
-            verify_phase_space_cache_h5(runner_result.phase_space_path)
+            verify_cache_h5(runner_result.phase_space_path, :phase_space)
         elseif cfg[:cache_mode] == :mu
             run_mu_cache_ensemble(base_runner_cfg, fields, paths.cache_h5; energy_GeV=energy_GeV, time_reference=time_reference)
-            verify_mu_cache_h5(paths.cache_h5)
+            verify_cache_h5(paths.cache_h5, :mu)
         else
             error("Unknown cache mode: " * string(cfg[:cache_mode]))
         end

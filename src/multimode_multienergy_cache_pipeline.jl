@@ -53,7 +53,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :cfl => 0.2,
         :seed => 42,
         :n_particles => 100000,
-        :precision => Float64,
+        :precision => Float32,
         :field_subset => nothing,
         :boundary => :periodic,
         :injection_mode => :isotropic,
@@ -70,7 +70,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :B_paths => ("i_mag_field", "j_mag_field", "k_mag_field"),
         :box_length_pc => 200.0,
         :field_subset => nothing,
-        :compute_backend => :auto,
+        :compute_backend => :gpu,
         :compute_precision => Float32,
         :gpu_threads => 256,
         :particle_chunk_size => 128,
@@ -102,6 +102,11 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :use_usetex => false,
     ),
     :dpp_overrides => Dict{Symbol, Any}(
+        :compute_backend => :gpu,
+        :compute_precision => Float32,
+        :gpu_threads => 256,
+        :gpu_lag_batch_size => 4,
+        :gpu_memory_fraction => 0.75,
         :particle_chunk_size => 128,
         :first_particle => 1,
         :n_particles_to_use => 10000,
@@ -1340,6 +1345,9 @@ function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_sav
     file["boundary_mode"] = string(cfg[:boundary])
     file["cache_mode"] = "mu"
     file["cache_output_precision"] = string(writer.outtype)
+    file["state_precision"] = string(cfg[:precision])
+    file["async_cache_writer_enabled"] = false
+    file["cache_writer_buffer_count"] = 1
     file["mu_unit"] = "dimensionless"
     RunnerMod.write_injection_metadata!(file, cfg)
     close(file)
@@ -1430,15 +1438,10 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     dy = y[2] - y[1]
     dz = z[2] - z[1]
 
-    dx1_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dx2_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dx3_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dp1_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dp2_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dp3_step = CUDA.fill(T(NaN), cfg[:n_particles])
     dmu_step = CUDA.fill(T(NaN), cfg[:n_particles])
+    dalive_count = CuArray(Int32[cfg[:n_particles]])
 
-    alive_fraction = Vector{Float64}(undef, nsteps)
+    alive_fraction = fill(NaN, nsteps)
     mu_cache_gib = RunnerMod.bytes_to_gib(estimate_mu_cache_bytes(cfg[:n_particles], nsave, cache_out_type))
 
     threads = 256
@@ -1470,21 +1473,11 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
                     println("Energy ", energy_GeV, " GeV: step ", si, "/", nsteps)
                 end
 
-                do_push = si < nsteps
-                @cuda threads=threads blocks=blocks RunnerMod.advance_particles_kernel!(
-                    dx1_step, dx2_step, dx3_step, dp1_step, dp2_step, dp3_step,
-                    dx1, dx2, dx3, dp1, dp2, dp3, dalive,
-                    dBx, dBy, dBz, dvx, dvy, dvz,
-                    dt, xmin, ymin, zmin, xmax, ymax, zmax, dx, dy, dz, nx, ny, nz, do_push, periodic_boundary
-                )
-
-                alive_fraction[si] = Float64(sum(dalive)) / Float64(cfg[:n_particles])
-
                 if next_save_ptr <= nsave && si == save_indices[next_save_ptr]
                     @cuda threads=threads blocks=blocks reconstruct_mu_step_kernel!(
                         dmu_step,
-                        dx1_step, dx2_step, dx3_step,
-                        dp1_step, dp2_step, dp3_step,
+                        dx1, dx2, dx3,
+                        dp1, dp2, dp3,
                         dBx, dBy, dBz,
                         xmin, ymin, zmin,
                         xmax, ymax, zmax,
@@ -1492,11 +1485,21 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
                         nx, ny, nz,
                     )
                     CUDA.synchronize()
+                    alive_fraction[si] = Float64(Array(dalive_count)[1]) / Float64(cfg[:n_particles])
                     write_mu_cache_step!(writer, next_save_ptr, Array(dmu_step))
                     next_save_ptr += 1
                 end
+
+                if si < nsteps
+                    @cuda threads=threads blocks=blocks RunnerMod.advance_particles_inplace_kernel!(
+                        dx1, dx2, dx3, dp1, dp2, dp3, dalive, dalive_count,
+                        dBx, dBy, dBz, dvx, dvy, dvz,
+                        dt, xmin, ymin, zmin, xmax, ymax, zmax, dx, dy, dz, nx, ny, nz, periodic_boundary
+                    )
+                end
             end
             CUDA.synchronize()
+            alive_fraction[end] = Float64(Array(dalive_count)[1]) / Float64(cfg[:n_particles])
         end
 
         finalize_mu_cache_writer!(
@@ -1643,6 +1646,7 @@ function run_combined_from_mu_cache(cfg)
     mu_axis_label = CombinedFullMod.mu_bin_axis_label(start_mode, bin_abs)
     heatmap_title = CombinedFullMod.dmumu_plot_title(bin_abs)
     collapsed_title = CombinedFullMod.dmumu_tau_average_title(bin_abs)
+    backend = CombinedFullMod.resolve_backend(cfg)
 
     h5open(cfg[:cache_h5], "r") do cache_file
         mu_dataset = cache_file["mu"]
@@ -1703,7 +1707,7 @@ function run_combined_from_mu_cache(cfg)
         println("Mu bins: ", n_bins, " from ", first(mu_edges), " to ", last(mu_edges))
         println("Particle chunk: ", chunk_size)
         println("Chunks: ", nchunks)
-        println("D_mumu accumulation backend: cpu")
+        println("D_mumu accumulation backend: ", backend)
         println("Julia threads: ", Threads.nthreads(), " active pool, max thread id ", Threads.maxthreadid())
 
         for chunk_id in 1:nchunks
@@ -1713,23 +1717,42 @@ function run_combined_from_mu_cache(cfg)
             println("Chunk ", chunk_id, "/", nchunks, ": ", length(chunk_indices), " selected particles, index span ", first(chunk_indices), "-", last(chunk_indices))
 
             mu_batch = read_mu_batch(mu_dataset, chunk_indices)
-            mu_chunk = permutedims(mu_batch, (2, 1))
-
-            CombinedFullMod.process_mu_chunk_dmumu_cpu!(
-                mu_chunk,
-                lag_steps,
-                mu_edges,
-                particle_counts,
-                particle_means,
-                particle_m2s,
-                pair_sum_squares,
-                pair_counts,
-                dmumu_counts,
-                dmumu_sum_delta,
-                dmumu_sum_delta2,
-                start_mode,
-                bin_abs,
-            )
+            if backend == :gpu
+                dmu_chunk = CuArray(permutedims(cfg[:compute_precision].(mu_batch), (2, 1)))
+                CombinedFullMod.process_mu_chunk_dmumu_gpu!(
+                    dmu_chunk,
+                    lag_steps,
+                    mu_edges,
+                    particle_counts,
+                    particle_means,
+                    particle_m2s,
+                    pair_sum_squares,
+                    pair_counts,
+                    dmumu_counts,
+                    dmumu_sum_delta,
+                    dmumu_sum_delta2,
+                    start_mode,
+                    bin_abs,
+                    cfg,
+                )
+            else
+                mu_chunk = permutedims(mu_batch, (2, 1))
+                CombinedFullMod.process_mu_chunk_dmumu_cpu!(
+                    mu_chunk,
+                    lag_steps,
+                    mu_edges,
+                    particle_counts,
+                    particle_means,
+                    particle_m2s,
+                    pair_sum_squares,
+                    pair_counts,
+                    dmumu_counts,
+                    dmumu_sum_delta,
+                    dmumu_sum_delta2,
+                    start_mode,
+                    bin_abs,
+                )
+            end
         end
 
         delta_df = CombinedFullMod.build_output_dataframe(lag_steps, t_s, t_norm, particle_counts, particle_means, particle_m2s, pair_sum_squares, pair_counts)
@@ -1749,7 +1772,7 @@ function run_combined_from_mu_cache(cfg)
         CombinedFullMod.save_combined_full_h5(
             cfg[:output_h5],
             save_cfg,
-            :mu_cache,
+            backend,
             estimated_pair_visits,
             delta_df,
             mu_edges,

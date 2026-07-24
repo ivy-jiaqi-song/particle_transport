@@ -1,6 +1,7 @@
 haskey(ENV, "MPLCONFIGDIR") || (ENV["MPLCONFIGDIR"] = "/tmp/mpl")
 
 using HDF5
+using CUDA
 using PyPlot
 using Random
 using Statistics
@@ -16,6 +17,11 @@ const DPP_FULL_CFG = Dict{Symbol, Any}(
     :trajectory_h5 => joinpath(PIPELINE_ROOT, "outputs", "campaigns", "0_5", "trajectory_cache", "phase_space_10000000_GeV.h5"),
     :cache_h5 => nothing,
     :cache_mode => :phase_space,
+    :compute_backend => :gpu,
+    :compute_precision => Float32,
+    :gpu_threads => 256,
+    :gpu_lag_batch_size => 4,
+    :gpu_memory_fraction => 0.75,
     :particle_chunk_size => 128,
     :first_particle => 1,
     :n_particles_to_use => 10000,
@@ -44,6 +50,31 @@ const DPP_FULL_CFG = Dict{Symbol, Any}(
 function parse_maybe_int(value::AbstractString)
     lowercase(strip(value)) in ("none", "nothing") && return nothing
     return parse(Int, value)
+end
+
+function parse_backend(value::AbstractString)
+    backend = Symbol(lowercase(strip(value)))
+    backend in (:auto, :gpu, :cpu) || error("compute_backend must be auto, gpu, or cpu.")
+    return backend
+end
+
+function parse_precision(value::AbstractString)
+    precision = lowercase(strip(value))
+    precision == "float32" && return Float32
+    precision == "float64" && return Float64
+    error("compute_precision must be Float32 or Float64.")
+end
+
+function resolve_backend(cfg)
+    requested = get(cfg, :compute_backend, :cpu)
+    requested == :cpu && return :cpu
+    if requested == :gpu
+        CUDA.functional() || error("[dpp].compute_backend = gpu but CUDA.functional() is false on this machine.")
+        return :gpu
+    elseif requested == :auto
+        return CUDA.functional() ? :gpu : :cpu
+    end
+    error("Unknown compute backend: " * string(requested) * ". Use gpu, cpu, or auto.")
 end
 
 function parse_particle_count(value::AbstractString)
@@ -88,6 +119,16 @@ function parse_cli_config(args)
             cfg[:output_h5] = split(argument, "=", limit=2)[2]
         elseif startswith(argument, "--output-dpp-png=")
             cfg[:output_dpp_png] = split(argument, "=", limit=2)[2]
+        elseif startswith(argument, "--compute-backend=")
+            cfg[:compute_backend] = parse_backend(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--compute-precision=")
+            cfg[:compute_precision] = parse_precision(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--gpu-threads=")
+            cfg[:gpu_threads] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--gpu-lag-batch-size=")
+            cfg[:gpu_lag_batch_size] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--gpu-memory-fraction=")
+            cfg[:gpu_memory_fraction] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--particle-chunk-size=")
             cfg[:particle_chunk_size] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--first-particle=")
@@ -298,6 +339,112 @@ function fill_energy_snapshots!(energy_snapshots, momenta, snapshot_indices, par
     return nothing
 end
 
+@inline function momentum_magnitude_gpu(px, py, pz)
+    return sqrt(px * px + py * py + pz * pz)
+end
+
+@inline function kinetic_energy_gev_from_pmag_gpu(pmag)
+    T = typeof(pmag)
+    if !isfinite(pmag)
+        return T(NaN)
+    end
+    gamma = sqrt(one(T) + (pmag / (T(M_P) * T(C_LIGHT)))^2)
+    return (gamma - one(T)) * T(M_P) * T(C_LIGHT)^2 / T(GEV_TO_J)
+end
+
+function dpp_chunk_kernel!(counts, sum_delta_p, sum_delta_p2, sum_delta_p_norm, sum_delta_p_norm2, momenta, lag_steps, p0)
+    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    stride = blockDim().x * gridDim().x
+    n_particles = size(momenta, 1)
+    nsteps = size(momenta, 3)
+    n_lags = length(lag_steps)
+    total = n_particles * n_lags
+    T = eltype(momenta)
+    p0_t = T(p0)
+
+    while index <= total
+        lag_index = ((index - 1) % n_lags) + 1
+        particle_index = ((index - 1) ÷ n_lags) + 1
+        lag_step = Int(lag_steps[lag_index])
+        if lag_step < nsteps
+            last_start = nsteps - lag_step
+            local_count = Int64(0)
+            local_sum_delta_p = zero(T)
+            local_sum_delta_p2 = zero(T)
+            local_sum_delta_p_norm = zero(T)
+            local_sum_delta_p_norm2 = zero(T)
+            @inbounds for step_index in 1:last_start
+                p_start = momentum_magnitude_gpu(momenta[particle_index, 1, step_index], momenta[particle_index, 2, step_index], momenta[particle_index, 3, step_index])
+                p_end = momentum_magnitude_gpu(momenta[particle_index, 1, step_index + lag_step], momenta[particle_index, 2, step_index + lag_step], momenta[particle_index, 3, step_index + lag_step])
+                if isfinite(p_start) && isfinite(p_end)
+                    delta_p = p_end - p_start
+                    delta_p_norm = delta_p / p0_t
+                    local_count += Int64(1)
+                    local_sum_delta_p += delta_p
+                    local_sum_delta_p2 += delta_p * delta_p
+                    local_sum_delta_p_norm += delta_p_norm
+                    local_sum_delta_p_norm2 += delta_p_norm * delta_p_norm
+                end
+            end
+            if local_count > 0
+                CUDA.@atomic counts[lag_index] += local_count
+                CUDA.@atomic sum_delta_p[lag_index] += Float64(local_sum_delta_p)
+                CUDA.@atomic sum_delta_p2[lag_index] += Float64(local_sum_delta_p2)
+                CUDA.@atomic sum_delta_p_norm[lag_index] += Float64(local_sum_delta_p_norm)
+                CUDA.@atomic sum_delta_p_norm2[lag_index] += Float64(local_sum_delta_p_norm2)
+            end
+        end
+        index += stride
+    end
+    return
+end
+
+function energy_snapshots_kernel!(energy_snapshots, momenta, snapshot_indices)
+    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    total = length(energy_snapshots)
+    index > total && return
+    n_snapshots = size(energy_snapshots, 1)
+    snapshot_position = ((index - 1) % n_snapshots) + 1
+    particle_index = ((index - 1) ÷ n_snapshots) + 1
+    step_index = Int(snapshot_indices[snapshot_position])
+    pmag = momentum_magnitude_gpu(momenta[particle_index, 1, step_index], momenta[particle_index, 2, step_index], momenta[particle_index, 3, step_index])
+    energy_snapshots[snapshot_position, particle_index] = Float64(kinetic_energy_gev_from_pmag_gpu(pmag))
+    return
+end
+
+function process_momenta_chunk_dpp_gpu!(momenta, lag_steps::Vector{Int}, p0::Float64, counts, sum_delta_p, sum_delta_p2, sum_delta_p_norm, sum_delta_p_norm2, cfg)
+    T = get(cfg, :compute_precision, Float32)
+    dmomenta = CuArray(T.(momenta))
+    dlag_steps = CuArray(Int32.(lag_steps))
+    n_lags = length(lag_steps)
+    dcounts = CUDA.zeros(Int64, n_lags)
+    dsum_delta_p = CUDA.zeros(Float64, n_lags)
+    dsum_delta_p2 = CUDA.zeros(Float64, n_lags)
+    dsum_delta_p_norm = CUDA.zeros(Float64, n_lags)
+    dsum_delta_p_norm2 = CUDA.zeros(Float64, n_lags)
+    threads = Int(get(cfg, :gpu_threads, 256))
+    blocks = min(4096, cld(size(momenta, 1) * n_lags, threads))
+    @cuda threads=threads blocks=blocks dpp_chunk_kernel!(dcounts, dsum_delta_p, dsum_delta_p2, dsum_delta_p_norm, dsum_delta_p_norm2, dmomenta, dlag_steps, p0)
+    CUDA.synchronize()
+    counts .+= Array(dcounts)
+    sum_delta_p .+= Array(dsum_delta_p)
+    sum_delta_p2 .+= Array(dsum_delta_p2)
+    sum_delta_p_norm .+= Array(dsum_delta_p_norm)
+    sum_delta_p_norm2 .+= Array(dsum_delta_p_norm2)
+    return dmomenta
+end
+
+function fill_energy_snapshots_gpu!(energy_snapshots, dmomenta, snapshot_indices, particle_offset::Integer, cfg)
+    dindices = CuArray(Int32.(snapshot_indices))
+    denergy = CUDA.fill(Float64(NaN), length(snapshot_indices), size(dmomenta, 1))
+    threads = Int(get(cfg, :gpu_threads, 256))
+    blocks = cld(length(denergy), threads)
+    @cuda threads=threads blocks=blocks energy_snapshots_kernel!(denergy, dmomenta, dindices)
+    CUDA.synchronize()
+    energy_snapshots[:, particle_offset:(particle_offset + size(dmomenta, 1) - 1)] = Array(denergy)
+    return nothing
+end
+
 function compute_dpp_arrays(counts, sum_delta_p, sum_delta_p2, sum_delta_p_norm, sum_delta_p_norm2, tau_s, tau_norm)
     n_lags = length(counts)
     mean_delta_p = fill(NaN, n_lags)
@@ -345,6 +492,9 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         file["trajectory_h5"] = string(cfg[:trajectory_h5])
         file["cache_h5"] = string(get(cfg, :cache_h5, cfg[:trajectory_h5]))
         file["cache_mode"] = "phase_space"
+        file["compute_backend"] = string(get(cfg, :resolved_compute_backend, get(cfg, :compute_backend, :cpu)))
+        file["compute_precision"] = string(get(cfg, :compute_precision, Float32))
+        file["backend_version"] = "gpu_dpp_full_v1"
         file["source_cache_uniform_time_axis"] = true
         file["source_cache_identity"] = string(get(cfg, :cache_h5, cfg[:trajectory_h5]))
         file["particle_chunk_size"] = Int(cfg[:particle_chunk_size])
@@ -457,6 +607,8 @@ function run_dpp_full(cfg)
     mkpath(cfg[:output_dir])
     mkpath(dirname(cfg[:output_h5]))
     mkpath(dirname(cfg[:output_dpp_png]))
+    backend = resolve_backend(cfg)
+    cfg[:resolved_compute_backend] = backend
     h5open(cfg[:trajectory_h5], "r") do trajectory_file
         haskey(trajectory_file, "momenta") || error("D_pp requires a phase-space cache with a momenta dataset: " * string(cfg[:trajectory_h5]))
         momenta_dataset = trajectory_file["momenta"]
@@ -499,14 +651,20 @@ function run_dpp_full(cfg)
         println("D_pp particle chunk: ", chunk_size)
         println("D_pp chunks: ", nchunks)
         println("D_pp energy snapshots: ", length(snapshot_indices))
+        println("D_pp accumulation backend: ", backend)
         for chunk_id in 1:nchunks
             selection_first = (chunk_id - 1) * chunk_size + 1
             selection_last = min(selected_particle_count, selection_first + chunk_size - 1)
             chunk_indices = particle_indices[selection_first:selection_last]
             println("D_pp chunk ", chunk_id, "/", nchunks, ": ", length(chunk_indices), " selected particles, index span ", first(chunk_indices), "-", last(chunk_indices))
             momenta = read_particle_batch(momenta_dataset, chunk_indices)
-            process_momenta_chunk_dpp_cpu!(momenta, lag_steps, p0, dpp_counts, dpp_sum_delta_p, dpp_sum_delta_p2, dpp_sum_delta_p_norm, dpp_sum_delta_p_norm2)
-            fill_energy_snapshots!(energy_snapshots, momenta, snapshot_indices, selection_first)
+            if backend == :gpu
+                dmomenta = process_momenta_chunk_dpp_gpu!(momenta, lag_steps, p0, dpp_counts, dpp_sum_delta_p, dpp_sum_delta_p2, dpp_sum_delta_p_norm, dpp_sum_delta_p_norm2, cfg)
+                fill_energy_snapshots_gpu!(energy_snapshots, dmomenta, snapshot_indices, selection_first, cfg)
+            else
+                process_momenta_chunk_dpp_cpu!(momenta, lag_steps, p0, dpp_counts, dpp_sum_delta_p, dpp_sum_delta_p2, dpp_sum_delta_p_norm, dpp_sum_delta_p_norm2)
+                fill_energy_snapshots!(energy_snapshots, momenta, snapshot_indices, selection_first)
+            end
         end
         mean_delta_p, mean_delta_p2, mean_delta_p_norm, mean_delta_p_norm2, dpp_raw_per_s, dpp_centered_per_s, dpp_raw_norm, dpp_centered_norm = compute_dpp_arrays(dpp_counts, dpp_sum_delta_p, dpp_sum_delta_p2, dpp_sum_delta_p_norm, dpp_sum_delta_p_norm2, tau_s, tau_norm)
         dpp_results = (

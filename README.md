@@ -104,7 +104,9 @@ The current public config layout is:
     particle with the requested pitch-angle cosine relative to the local
     magnetic field while keeping gyrophase random.
   - Particle and cache burden settings: particle count, precision, field subset,
-    output precision.
+    output precision. Production GPU runs default to `precision = "Float32"`
+    and `trajectory_output_precision = "Float32"`; `Float64` remains available
+    as an explicit reference/debugging precision.
 
 - `[dmumu]`
   - D_mumu-only transport-analysis settings.
@@ -112,12 +114,16 @@ The current public config layout is:
     `particles = "all"` uses all cached particles. Lag settings still apply in
     both cases.
   - Lag sampling, particle sampling, mu binning, backend, chunk size, and
-    safety-limit controls are independent from `[dpp]`.
+    safety-limit controls are independent from `[dpp]`. `compute_backend` accepts
+    `gpu`, `cpu`, or `auto`; explicit `gpu` fails early when CUDA is unavailable.
+    GPU runs use `compute_precision`, `gpu_threads`, `gpu_lag_batch_size`, and
+    `gpu_memory_fraction` to control device work.
   - `mu_bin_abs = true` bins D_mumu by `abs(mu_start)` over `mu_min = 0.0` to
     `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
 
 - `[dpp]`
-  - D_pp-only controls: particle selection, lag sampling, chunk size, and
+  - D_pp-only controls: particle selection, lag sampling, chunk size, backend,
+    compute precision, GPU thread count, lag batch size, memory fraction, and
     `n_energy_snapshots` are independent from `[dmumu]`.
   - D_pp is a one-dimensional function of lag, `D_pp(tau)`, so its figure is
     named `dpp_tau_curve_full.png` rather than a tau-average product.

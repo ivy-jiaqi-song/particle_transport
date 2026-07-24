@@ -257,3 +257,13 @@ end
     @test !result.valid
     @test result.reason == :time_length_mismatch
 end
+
+@testset "gpu production defaults" begin
+    config_text = read(joinpath(@__DIR__, "..", "configs", "run_config.example.toml"), String)
+    @test occursin("precision = \"Float32\"", config_text)
+    @test occursin("trajectory_output_precision = \"Float32\"", config_text)
+    @test occursin("compute_backend = \"gpu\"", config_text)
+    @test occursin("compute_precision = \"Float32\"", config_text)
+    @test occursin("gpu_lag_batch_size = 4", config_text)
+    @test occursin("gpu_memory_fraction = 0.75", config_text)
+end

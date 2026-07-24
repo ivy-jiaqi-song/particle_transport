@@ -23,6 +23,7 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :dmumu_start_mode => :sliding,
     :lag_mode => :uniform_samples,
     :lag_range_policy => :fixed,
+    :lag_common_scope => :campaign,
     :lag_boundary_policy => :strict,
     :max_lag_boundary_relative_error => 0.0,
     :lag_min_gyroperiods => nothing,
@@ -80,6 +81,7 @@ function print_usage()
       --lag-max-gyroperiods=VALUE
       --lag-mode=uniform|stride
       --lag-range-policy=fixed|first-cache-step|common-cache-intersection
+      --lag-common-scope=campaign|reference-group
       --lag-boundary-policy=strict|nearest
       --max-lag-boundary-relative-error=VALUE
       --lag-step-stride=N
@@ -229,6 +231,8 @@ function parse_cli_config(args)
             cfg[:lag_mode] = parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-range-policy=") || startswith(argument, "--dmumu-lag-range-policy=")
             cfg[:lag_range_policy] = normalize_lag_range_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-common-scope=") || startswith(argument, "--dmumu-lag-common-scope=")
+            cfg[:lag_common_scope] = normalize_lag_common_scope(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-boundary-policy=") || startswith(argument, "--dmumu-lag-boundary-policy=")
             cfg[:lag_boundary_policy] = normalize_lag_boundary_policy(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--max-lag-boundary-relative-error=") || startswith(argument, "--dmumu-max-lag-boundary-relative-error=")
@@ -840,6 +844,7 @@ function save_combined_full_h5(
         file["particle_indices"] = particle_indices
         file["lag_mode"] = string(cfg[:lag_mode])
         file["lag_range_policy"] = string(get(cfg, :lag_range_policy, :fixed))
+        file["lag_common_scope"] = string(get(cfg, :lag_common_scope, :campaign))
         file["lag_boundary_policy"] = string(get(cfg, :lag_boundary_policy, :strict))
         file["max_lag_boundary_relative_error"] = Float64[get(cfg, :max_lag_boundary_relative_error, 0.0)]
         file["n_lag_samples"] = length(lag_steps)
@@ -880,6 +885,7 @@ function save_combined_full_h5(
             end
             if lag_grid !== nothing
                 delta_group["requested_tau_gyroperiods"] = lag_grid.requested_tau_gyroperiods
+                delta_group["common_requested_tau_gyroperiods"] = lag_grid.common_requested_tau_gyroperiods
                 delta_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
             end
 
@@ -890,6 +896,7 @@ function save_combined_full_h5(
             dmumu_group["lag_steps"] = lag_steps
             if lag_grid !== nothing
                 dmumu_group["requested_tau_gyroperiods"] = lag_grid.requested_tau_gyroperiods
+                dmumu_group["common_requested_tau_gyroperiods"] = lag_grid.common_requested_tau_gyroperiods
                 dmumu_group["tau_gyroperiods"] = lag_grid.tau_gyroperiods
                 dmumu_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
                 file["lag_mapping_max_error_gyroperiods"] = Float64[lag_grid.max_lag_mapping_error_gyroperiods]
@@ -908,6 +915,11 @@ function save_combined_full_h5(
                 file["effective_lag_min_gyroperiods"] = Float64[lag_grid.effective_lag_min_gyroperiods]
                 file["effective_lag_max_gyroperiods"] = Float64[lag_grid.effective_lag_max_gyroperiods]
                 file["lag_comparison_group_identity"] = lag_grid.lag_comparison_group_identity
+                file["preflight_job_id"] = lag_grid.preflight_job_id
+                file["preflight_reference_group_id"] = lag_grid.preflight_reference_group_id
+                file["lag_group_member_count"] = Int[lag_grid.lag_group_member_count]
+                file["lag_group_member_modes"] = lag_grid.lag_group_member_modes
+                file["lag_group_member_energies_GeV"] = lag_grid.lag_group_member_energies_GeV
                 file["lag_grid_source"] = string(lag_grid.lag_source)
             else
                 dmumu_group["requested_tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)

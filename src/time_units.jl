@@ -221,6 +221,12 @@ function normalize_lag_range_policy(value)
     return policy
 end
 
+function normalize_lag_common_scope(value)
+    scope = Symbol(replace(lowercase(strip(String(value))), "-" => "_"))
+    scope in (:campaign, :reference_group) || error("lag_common_scope must be campaign or reference-group.")
+    return scope
+end
+
 function lag_cache_summary(t_gyroperiods)
     nsteps = length(t_gyroperiods)
     nsteps > 1 || error("Need at least two cached samples to resolve lags.")
@@ -419,6 +425,7 @@ function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=2)
     return (
         lag_steps = lag_steps,
         requested_tau_gyroperiods = requested_unique_gp,
+        common_requested_tau_gyroperiods = Float64.(requested_tau_gp),
         tau_gyroperiods = actual_gp,
         tau_norm = tau_norm,
         lag_mapping_error_gyroperiods = errors_gp,
@@ -441,6 +448,12 @@ function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=2)
         effective_lag_min_gyroperiods = isfinite(effective_min_gp) ? effective_min_gp : requested_min_gp,
         effective_lag_max_gyroperiods = isfinite(effective_max_gp) ? effective_max_gp : requested_max_gp,
         lag_comparison_group_identity = String(get(cfg, :lag_comparison_group_identity, "not-applicable")),
+        lag_common_scope = normalize_lag_common_scope(get(cfg, :lag_common_scope, :campaign)),
+        preflight_job_id = String(get(cfg, :preflight_job_id, "not-applicable")),
+        preflight_reference_group_id = String(get(cfg, :preflight_reference_group_id, "not-applicable")),
+        lag_group_member_count = Int(get(cfg, :lag_group_member_count, 1)),
+        lag_group_member_modes = String(get(cfg, :lag_group_member_modes, "not-applicable")),
+        lag_group_member_energies_GeV = String(get(cfg, :lag_group_member_energies_GeV, "not-applicable")),
         lag_source = source,
     )
 end

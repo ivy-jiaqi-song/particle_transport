@@ -24,6 +24,7 @@ const DPP_FULL_CFG = Dict{Symbol, Any}(
     :particle_block_size => 128,
     :lag_mode => :uniform_samples,
     :lag_range_policy => :fixed,
+    :lag_common_scope => :campaign,
     :lag_boundary_policy => :strict,
     :max_lag_boundary_relative_error => 0.0,
     :lag_min_gyroperiods => nothing,
@@ -75,7 +76,7 @@ function parse_cli_config(args)
     cfg = Dict{Symbol, Any}(DPP_FULL_CFG)
     for argument in args
         if argument == "--help" || argument == "-h"
-            println("Usage: julia src/compute_dpp_full.jl --trajectory-h5=PATH --output-dir=DIR [--lag-min-gyroperiods=A --lag-max-gyroperiods=B --n-lag-samples=N --lag-boundary-policy=strict|nearest --lag-range-policy=fixed|first-cache-step|common-cache-intersection | legacy step controls]")
+            println("Usage: julia src/compute_dpp_full.jl --trajectory-h5=PATH --output-dir=DIR [--lag-min-gyroperiods=A --lag-max-gyroperiods=B --n-lag-samples=N --lag-boundary-policy=strict|nearest --lag-range-policy=fixed|first-cache-step|common-cache-intersection --lag-common-scope=campaign|reference-group | legacy step controls]")
             exit(0)
         elseif startswith(argument, "--trajectory-h5=")
             cfg[:trajectory_h5] = split(argument, "=", limit=2)[2]
@@ -103,6 +104,8 @@ function parse_cli_config(args)
             cfg[:lag_mode] = parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-range-policy=") || startswith(argument, "--dpp-lag-range-policy=")
             cfg[:lag_range_policy] = normalize_lag_range_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--lag-common-scope=") || startswith(argument, "--dpp-lag-common-scope=")
+            cfg[:lag_common_scope] = normalize_lag_common_scope(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--lag-boundary-policy=") || startswith(argument, "--dpp-lag-boundary-policy=")
             cfg[:lag_boundary_policy] = normalize_lag_boundary_policy(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--max-lag-boundary-relative-error=") || startswith(argument, "--dpp-max-lag-boundary-relative-error=")
@@ -354,6 +357,7 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         file["particle_indices"] = particle_indices
         file["lag_mode"] = string(cfg[:lag_mode])
         file["lag_range_policy"] = string(get(cfg, :lag_range_policy, :fixed))
+        file["lag_common_scope"] = string(get(cfg, :lag_common_scope, :campaign))
         file["lag_boundary_policy"] = string(get(cfg, :lag_boundary_policy, :strict))
         file["max_lag_boundary_relative_error"] = Float64[get(cfg, :max_lag_boundary_relative_error, 0.0)]
         file["n_lag_samples"] = length(lag_steps)
@@ -375,6 +379,7 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         dpp_group["lag_steps"] = lag_steps
         if lag_grid !== nothing
             dpp_group["requested_tau_gyroperiods"] = lag_grid.requested_tau_gyroperiods
+            dpp_group["common_requested_tau_gyroperiods"] = lag_grid.common_requested_tau_gyroperiods
             dpp_group["tau_gyroperiods"] = lag_grid.tau_gyroperiods
             dpp_group["lag_mapping_error_gyroperiods"] = lag_grid.lag_mapping_error_gyroperiods
             file["lag_mapping_max_error_gyroperiods"] = Float64[lag_grid.max_lag_mapping_error_gyroperiods]
@@ -393,6 +398,11 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
             file["effective_lag_min_gyroperiods"] = Float64[lag_grid.effective_lag_min_gyroperiods]
             file["effective_lag_max_gyroperiods"] = Float64[lag_grid.effective_lag_max_gyroperiods]
             file["lag_comparison_group_identity"] = lag_grid.lag_comparison_group_identity
+            file["preflight_job_id"] = lag_grid.preflight_job_id
+            file["preflight_reference_group_id"] = lag_grid.preflight_reference_group_id
+            file["lag_group_member_count"] = Int[lag_grid.lag_group_member_count]
+            file["lag_group_member_modes"] = lag_grid.lag_group_member_modes
+            file["lag_group_member_energies_GeV"] = lag_grid.lag_group_member_energies_GeV
             file["lag_grid_source"] = string(lag_grid.lag_source)
         else
             dpp_group["requested_tau_gyroperiods"] = tOmega0_to_gyroperiods.(tau_norm)

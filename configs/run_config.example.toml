@@ -129,6 +129,7 @@ particle_block_size = 128
 # stride: use lag_min_gyroperiods, lag_min_gyroperiods + lag_stride_gyroperiods, ...
 lag_mode = "uniform-samples"
 lag_range_policy = "common-cache-intersection"  # "fixed", "first-cache-step", or "common-cache-intersection".
+lag_common_scope = "reference-group"  # "campaign" or "reference-group" for cross-mode comparisons.
 lag_boundary_policy = "nearest"  # "strict" preserves exact range rejection; "nearest" allows bounded cache-step snapping.
 max_lag_boundary_relative_error = 0.05
 lag_min_gyroperiods = 0.015915494309189534
@@ -159,6 +160,7 @@ particle_seed = 20260423
 particle_block_size = 128
 lag_mode = "uniform-samples"
 lag_range_policy = "common-cache-intersection"
+lag_common_scope = "reference-group"
 lag_boundary_policy = "nearest"
 max_lag_boundary_relative_error = 0.05
 lag_min_gyroperiods = 0.015915494309189534

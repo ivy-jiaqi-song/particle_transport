@@ -231,14 +231,24 @@ Lag range controls in `[dmumu]` and `[dpp]`:
 | Control | Values |
 | --- | --- |
 | `lag_range_policy` | `fixed`, `first-cache-step`, `common-cache-intersection` |
+| `lag_common_scope` | `campaign`, `reference-group` |
 | `lag_boundary_policy` | `strict`, `nearest` |
 | `max_lag_boundary_relative_error` | nonnegative relative tolerance for `nearest` |
 
 `fixed` uses the configured `lag_min_gyroperiods` and `lag_max_gyroperiods`.
 `first-cache-step` starts each job at its first positive cached lag and rejects a
 numeric `lag_min_gyroperiods`. `common-cache-intersection` intersects the
-representable cache ranges across the selected energies in the current campaign
-and maps one common nominal requested grid onto each job's actual cache axis.
+representable cache ranges across the selected comparison group and maps one
+common nominal requested grid onto each job's actual cache axis.
+
+`lag_common_scope = "campaign"` limits common intersections to one existing
+campaign/mode grouping. `lag_common_scope = "reference-group"` groups selected
+total, Alfven, fast, and slow jobs when they share the same total-field reference
+source, loaded field subset, grid size, box geometry, particle species, and
+trajectory timing controls. The mode is kept in each job identity but is not part
+of the reference-group key, so direct mode-decomposition comparisons use the same
+nominal requested lag grid. Adding or removing modes or energies changes the
+group identity and invalidates old common-grid outputs.
 
 `strict` preserves the historical behavior: configured boundaries must already
 lie inside the representable cache range. `nearest` can adjust a boundary to the
@@ -250,11 +260,12 @@ mapping bound, duplicate mapped offsets are removed deterministically, and the
 HDF5 output records requested lags, actual lags, mapping errors, policy names,
 effective boundaries, duplicate counts, and the comparison group identity.
 
-Before any trajectory cache is generated or reused, each campaign prints a timing
-preflight table for all selected energies showing the active timestep limiter,
-requested and actual cache interval, and representable lag range. If a requested
-`D_mumu` or `D_pp` lag policy cannot produce a valid grid, the run fails at this
-preflight stage.
+Before any trajectory cache is generated or reused, the top-level runner builds
+the full selected job list, loads the required field/reference data for timing,
+forms comparison groups, validates every requested `D_mumu` and `D_pp` lag grid,
+prints a preflight report, and writes `timing_preflight.tsv` under the output
+root. If any lag policy cannot produce a valid grid, the run fails at this
+preflight stage before any trajectory starts.
 
 ## Campaign Examples
 

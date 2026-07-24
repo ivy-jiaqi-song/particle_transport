@@ -190,6 +190,10 @@ end
     @test common_grid.effective_lag_min_gyroperiods ≈ 0.30
     @test common_grid.effective_lag_max_gyroperiods ≈ 4.8
     @test common_grid.lag_comparison_group_identity == "test-group"
+    @test common_grid.common_requested_tau_gyroperiods[1] ≈ 0.30
+    @test normalize_lag_common_scope("reference-group") == :reference_group
+    @test normalize_lag_common_scope("campaign") == :campaign
+    @test_throws ErrorException normalize_lag_common_scope("mode")
 
     no_overlap = copy(common_cfg)
     no_overlap[:common_cache_lag_min_gyroperiods] = 5.0

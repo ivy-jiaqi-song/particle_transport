@@ -82,6 +82,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :dmumu_start_mode => :sliding,
         :lag_mode => :uniform_samples,
         :lag_range_policy => :fixed,
+        :lag_common_scope => :campaign,
         :lag_boundary_policy => :strict,
         :max_lag_boundary_relative_error => 0.0,
         :lag_min_gyroperiods => nothing,
@@ -109,6 +110,7 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :particle_block_size => 128,
         :lag_mode => :uniform_samples,
         :lag_range_policy => :fixed,
+        :lag_common_scope => :campaign,
         :lag_boundary_policy => :strict,
         :max_lag_boundary_relative_error => 0.0,
         :lag_min_gyroperiods => nothing,
@@ -740,6 +742,198 @@ function run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
     return timing_plans
 end
 
+function campaign_base_runner_cfg(campaign_cfg)
+    return merge_cfg(
+        RunnerMod.CFG,
+        merge_cfg(
+            campaign_cfg[:trajectory_overrides],
+            Dict{Symbol, Any}(
+                :file => campaign_cfg[:turbulence_h5],
+                :trajectory_mode => campaign_cfg[:mode_name],
+                :trajectory_field_source_path => campaign_cfg[:turbulence_h5],
+                :trajectory_field_source_identity => campaign_cfg[:turbulence_h5],
+                :mu_cache_output_precision => campaign_cfg[:mu_cache_output_precision],
+            ),
+        ),
+    )
+end
+
+function transport_job_id(campaign_cfg, energy_GeV)
+    return join((campaign_cfg[:campaign_tag], campaign_cfg[:mode_name], energy_tag(energy_GeV)), "|")
+end
+
+function timing_identity_string(runner_cfg)
+    keys = (:integration_steps_per_gyroperiod, :eta, :trajectory_duration_gyroperiods, :tOmega0_max, :use_cfl, :cfl, :trajectory_save_interval_gyroperiods, :trajectory_time_stride)
+    return join([string(key) * "=" * string(get(runner_cfg, key, nothing)) for key in keys], ";")
+end
+
+function reference_group_id(campaign_cfg, runner_cfg, fields=nothing)
+    grid_size = fields === nothing ? "unknown" : string(size(fields[1]))
+    parts = (
+        "reference=" * string(campaign_cfg[:reference_h5]),
+        "field_subset=" * string(get(runner_cfg, :field_subset, nothing)),
+        "grid_size=" * grid_size,
+        "box_length_pc=" * string(get(runner_cfg, :box_length_pc, nothing)),
+        "particle_species=proton",
+        "timing=" * timing_identity_string(runner_cfg),
+    )
+    return join(parts, "|")
+end
+
+function analysis_signature(analysis_cfg)
+    keys = (:lag_mode, :lag_range_policy, :lag_boundary_policy, :max_lag_boundary_relative_error, :lag_min_gyroperiods, :lag_max_gyroperiods, :lag_stride_gyroperiods, :n_lag_samples)
+    return join([string(key) * "=" * string(get(analysis_cfg, key, nothing)) for key in keys], ";")
+end
+
+function lag_group_id(plan, analysis_cfg, analysis_label::AbstractString)
+    scope = CombinedFullMod.normalize_lag_common_scope(get(analysis_cfg, :lag_common_scope, :campaign))
+    prefix = scope == :campaign ? plan.campaign_tag : plan.reference_group_id
+    return join((analysis_label, string(scope), prefix, analysis_signature(analysis_cfg)), "|")
+end
+
+function member_modes_string(members)
+    return join(sort(unique(String(plan.trajectory_mode) for plan in members)), ",")
+end
+
+function member_energies_string(members)
+    energies = sort(unique(Float64(plan.energy_GeV) for plan in members))
+    return join([@sprintf("%.12g", energy) for energy in energies], ",")
+end
+
+function analysis_cfg_for_group(base_cfg, members, group_id::AbstractString, analysis_label::AbstractString)
+    cfg = shallow_copy_dict(base_cfg)
+    scope = CombinedFullMod.normalize_lag_common_scope(get(cfg, :lag_common_scope, :campaign))
+    if CombinedFullMod.normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed)) == :common_cache_intersection
+        common_min = maximum(plan.cache_lag_min_gyroperiods for plan in members)
+        common_max = minimum(plan.cache_lag_max_gyroperiods for plan in members)
+        common_max > common_min || error(analysis_label * " common-cache-intersection has no positive lag overlap for comparison group " * group_id)
+        cfg[:common_cache_lag_min_gyroperiods] = common_min
+        cfg[:common_cache_lag_max_gyroperiods] = common_max
+    end
+    cfg[:analysis_label] = analysis_label
+    cfg[:lag_comparison_group_identity] = group_id
+    cfg[:lag_common_scope] = scope
+    cfg[:lag_group_member_count] = length(members)
+    cfg[:lag_group_member_modes] = member_modes_string(members)
+    cfg[:lag_group_member_energies_GeV] = member_energies_string(members)
+    first_grid = CombinedFullMod.resolve_lag_grid(cfg, first(members).t_gyroperiods)
+    cfg[:common_requested_tau_gyroperiods] = first_grid.common_requested_tau_gyroperiods
+    return cfg
+end
+
+function validate_preflight_group!(group_cfg, members, analysis_label::AbstractString)
+    for plan in members
+        try
+            CombinedFullMod.resolve_lag_grid(group_cfg, plan.t_gyroperiods)
+        catch error_instance
+            msg = sprint(showerror, error_instance)
+            error("Timing preflight failed for " * analysis_label * " job " * plan.job_id * " (mode=" * plan.trajectory_mode * ", energy=" * string(plan.energy_GeV) * " GeV, reference_group=" * plan.reference_group_id * ", cache_dt=" * string(plan.actual_save_interval_gyroperiods) * " Tg0, cache_range=[" * string(plan.cache_lag_min_gyroperiods) * ", " * string(plan.cache_lag_max_gyroperiods) * "] Tg0, lag_range_policy=" * string(get(group_cfg, :lag_range_policy, :fixed)) * ", lag_boundary_policy=" * string(get(group_cfg, :lag_boundary_policy, :strict)) * "): " * msg)
+        end
+    end
+    return nothing
+end
+
+function write_global_preflight_tsv(path::AbstractString, job_plans, groups)
+    ensure_parent(path)
+    open(path, "w") do io
+        println(io, "section\tid\treference_group_id\tmode\tenergy_GeV\tlimiter\tdt_gyroperiods\tcache_dt_gyroperiods\tcache_lag_min\tcache_lag_max\tcache_samples\tscope\tmembers\tmodes\tenergies\teffective_min\teffective_max\trequested_lag_count")
+        for plan in job_plans
+            println(io, join(("job", plan.job_id, plan.reference_group_id, plan.trajectory_mode, @sprintf("%.12g", plan.energy_GeV), plan.timestep_limited_by, string(plan.dt_gyroperiods), string(plan.actual_save_interval_gyroperiods), string(plan.cache_lag_min_gyroperiods), string(plan.cache_lag_max_gyroperiods), string(plan.cache_sample_count), "", "", "", "", "", "", ""), '\t'))
+        end
+        for (_, group) in groups
+            println(io, join(("group", group.group_id, "", "", "", "", "", "", "", "", "", string(get(group.cfg, :lag_common_scope, :campaign)), string(length(group.members)), get(group.cfg, :lag_group_member_modes, ""), get(group.cfg, :lag_group_member_energies_GeV, ""), string(get(group.cfg, :common_cache_lag_min_gyroperiods, NaN)), string(get(group.cfg, :common_cache_lag_max_gyroperiods, NaN)), string(length(get(group.cfg, :common_requested_tau_gyroperiods, Float64[])))), '\t'))
+        end
+    end
+    return nothing
+end
+
+function print_global_preflight_report(job_plans, groups)
+    println("Global timing preflight:")
+    println("Job\tRef group\tMode\tEnergy [GeV]\tLimiter\tdt/Tg0\tCache dt/Tg0\tCache lag range/Tg0\tSamples")
+    for plan in job_plans
+        println(join((plan.job_id, plan.reference_group_id, plan.trajectory_mode, @sprintf("%.6g", plan.energy_GeV), plan.timestep_limited_by, @sprintf("%.12g", plan.dt_gyroperiods), @sprintf("%.12g", plan.actual_save_interval_gyroperiods), "[" * @sprintf("%.12g", plan.cache_lag_min_gyroperiods) * ", " * @sprintf("%.12g", plan.cache_lag_max_gyroperiods) * "]", string(plan.cache_sample_count)), '\t'))
+    end
+    println("Analysis comparison groups:")
+    for (_, group) in sort(collect(groups); by=pair -> pair.first)
+        cfg = group.cfg
+        println(group.group_id)
+        println("  scope                    = ", get(cfg, :lag_common_scope, :campaign))
+        println("  member count             = ", length(group.members))
+        println("  member modes             = ", get(cfg, :lag_group_member_modes, ""))
+        println("  member energies [GeV]    = ", get(cfg, :lag_group_member_energies_GeV, ""))
+        println("  configured range         = ", get(cfg, :lag_min_gyroperiods, nothing), " to ", get(cfg, :lag_max_gyroperiods, nothing), " Tg0")
+        if haskey(cfg, :common_cache_lag_min_gyroperiods)
+            println("  common representable     = ", cfg[:common_cache_lag_min_gyroperiods], " to ", cfg[:common_cache_lag_max_gyroperiods], " Tg0")
+        end
+        grid = CombinedFullMod.resolve_lag_grid(cfg, first(group.members).t_gyroperiods)
+        println("  effective range          = ", grid.effective_lag_min_gyroperiods, " to ", grid.effective_lag_max_gyroperiods, " Tg0")
+        println("  requested lag count      = ", grid.requested_lag_count)
+        println("  boundary policy          = ", get(cfg, :lag_boundary_policy, :strict))
+        println("  relative tolerance       = ", get(cfg, :max_lag_boundary_relative_error, 0.0))
+    end
+    return nothing
+end
+
+function run_global_timing_preflight!(cfg)
+    job_plans = Any[]
+    campaign_cfgs = Dict{String, Any}()
+    for campaign_spec in cfg[:mode_campaigns]
+        campaign_cfg = materialize_campaign_cfg(cfg, campaign_spec)
+        base_runner_cfg = campaign_base_runner_cfg(campaign_cfg)
+        println("Preflight loading trajectory fields for ", campaign_cfg[:campaign_tag])
+        fields = RunnerMod.load_static_fields(base_runner_cfg, base_runner_cfg[:precision])
+        reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => campaign_cfg[:reference_h5]))
+        println("Preflight loading total reference fields for ", campaign_cfg[:campaign_tag])
+        reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
+        campaign_cfgs[String(campaign_cfg[:campaign_tag])] = campaign_cfg
+        for energy_GeV in campaign_cfg[:energies]
+            plan = resolved_job_timing(campaign_cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
+            ref_group = reference_group_id(campaign_cfg, base_runner_cfg, fields)
+            job_id = transport_job_id(campaign_cfg, energy_GeV)
+            push!(job_plans, merge(plan, (job_id=job_id, reference_group_id=ref_group)))
+        end
+    end
+
+    groups = Dict{String, Any}()
+    job_analysis_cfgs = Dict{String, Dict{Symbol, Any}}()
+    for analysis in ((label="D_mumu", enabled=cfg[:compute_dmumu], base=CombinedFullMod.COMBINED_FULL_CFG, overrides=cfg[:dmumu_overrides], key=:dmumu_cfg), (label="D_pp", enabled=cfg[:compute_dpp], base=DppFullMod.DPP_FULL_CFG, overrides=cfg[:dpp_overrides], key=:dpp_cfg))
+        analysis.enabled || continue
+        base_analysis_cfg = merge_cfg(analysis.base, analysis.overrides)
+        pending = Dict{String, Vector{Any}}()
+        for plan in job_plans
+            group_id = lag_group_id(plan, base_analysis_cfg, analysis.label)
+            push!(get!(pending, group_id, Any[]), plan)
+        end
+        for (group_id, members) in pending
+            group_cfg = analysis_cfg_for_group(base_analysis_cfg, members, group_id, analysis.label)
+            validate_preflight_group!(group_cfg, members, analysis.label)
+            groups[group_id] = (group_id=group_id, analysis_label=analysis.label, cfg=group_cfg, members=members)
+            for plan in members
+                per_job = get!(job_analysis_cfgs, plan.job_id, Dict{Symbol, Any}())
+                job_cfg = shallow_copy_dict(group_cfg)
+                job_cfg[:preflight_job_id] = plan.job_id
+                job_cfg[:preflight_reference_group_id] = plan.reference_group_id
+                per_job[analysis.key] = job_cfg
+            end
+        end
+    end
+
+    jobs = Dict{String, Any}()
+    for plan in job_plans
+        analysis_cfgs = get(job_analysis_cfgs, plan.job_id, Dict{Symbol, Any}())
+        jobs[plan.job_id] = merge(plan, (
+            dmumu_cfg = get(analysis_cfgs, :dmumu_cfg, nothing),
+            dpp_cfg = get(analysis_cfgs, :dpp_cfg, nothing),
+        ))
+    end
+    result = (jobs=jobs, groups=groups, job_order=[plan.job_id for plan in job_plans])
+    cfg[:global_preflight_result] = result
+    print_global_preflight_report([jobs[job_id] for job_id in result.job_order], groups)
+    mkpath(cfg[:output_root])
+    write_global_preflight_tsv(joinpath(cfg[:output_root], "timing_preflight.tsv"), [jobs[job_id] for job_id in result.job_order], groups)
+    return result
+end
+
 function verify_cache_time_metadata(path_h5::AbstractString, cfg, fields, energy_GeV, time_reference)
     trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(cfg, fields, energy_GeV, time_reference)
     h5open(path_h5, "r") do file
@@ -762,6 +956,20 @@ function verify_cache_time_metadata(path_h5::AbstractString, cfg, fields, energy
         isapprox(analysis_duration_gp, expected_analysis_duration_gp; rtol=1.0e-10, atol=1.0e-12) || error("Existing cache analysis duration does not match requested uniform cache cadence; regenerate " * path_h5)
     end
     return true
+end
+
+function assert_preflight_timing_matches(plan, cfg, fields, energy_GeV, time_reference)
+    plan === nothing && return nothing
+    trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(cfg, fields, energy_GeV, time_reference)
+    isapprox(expected_Omega0, plan.Omega0_reference_s_inv; rtol=1.0e-10, atol=0.0) || error("Preflight Omega0 does not match execution timing for job " * plan.job_id)
+    isapprox(expected_B0, plan.B0_reference_T; rtol=1.0e-10, atol=0.0) || error("Preflight B0 does not match execution timing for job " * plan.job_id)
+    isapprox(trajectory_time.dt_s, plan.trajectory_time.dt_s; rtol=1.0e-10, atol=0.0) || error("Preflight dt_s does not match execution timing for job " * plan.job_id)
+    isapprox(trajectory_time.dt_gyroperiods, plan.dt_gyroperiods; rtol=1.0e-10, atol=1.0e-12) || error("Preflight dt_gyroperiods does not match execution timing for job " * plan.job_id)
+    trajectory_time.timestep_limited_by == plan.timestep_limited_by || error("Preflight timestep limiter does not match execution timing for job " * plan.job_id)
+    save_time.trajectory_time_stride == plan.save_stride_integration_steps || error("Preflight save stride does not match execution timing for job " * plan.job_id)
+    isapprox(save_time.actual_trajectory_save_interval_gyroperiods, plan.actual_save_interval_gyroperiods; rtol=1.0e-10, atol=1.0e-12) || error("Preflight cache interval does not match execution timing for job " * plan.job_id)
+    trajectory_time.n_integration_steps == plan.integration_sample_count || error("Preflight integration sample count does not match execution timing for job " * plan.job_id)
+    return nothing
 end
 
 function read_cache_time_summary(path_h5::AbstractString)
@@ -899,9 +1107,13 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_mu_bin_abs = h5_scalar_bool_or(file, "mu_bin_abs", false)
         stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
         stored_lag_range_policy = CombinedFullMod.normalize_lag_range_policy(h5_scalar_string_or(file, "lag_range_policy", "fixed"))
+        stored_lag_common_scope = CombinedFullMod.normalize_lag_common_scope(h5_scalar_string_or(file, "lag_common_scope", "campaign"))
         stored_lag_boundary_policy = CombinedFullMod.normalize_lag_boundary_policy(h5_scalar_string_or(file, "lag_boundary_policy", "strict"))
         stored_boundary_rel_error = h5_scalar_float_or(file, "max_lag_boundary_relative_error", 0.0)
         stored_group_identity = h5_scalar_string_or(file, "lag_comparison_group_identity", "not-applicable")
+        stored_member_count = h5_scalar_int_or(file, "lag_group_member_count", 1)
+        stored_member_modes = h5_scalar_string_or(file, "lag_group_member_modes", "not-applicable")
+        stored_member_energies = h5_scalar_string_or(file, "lag_group_member_energies_GeV", "not-applicable")
         stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
         stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
         stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
@@ -912,15 +1124,26 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_lag_stride_gp = h5_scalar_float_or(file, "lag_stride_gyroperiods", nothing)
         stored_n_mu_bins = h5_scalar_int_or(file, "n_mu_bins", Int(cfg[:n_mu_bins]))
         stored_mu_edges = read(file["dmumu"]["mu_edges"])
+        if haskey(cfg, :common_requested_tau_gyroperiods)
+            haskey(file["dmumu"], "common_requested_tau_gyroperiods") || return false
+            stored_common_requested_tau = Float64.(read(file["dmumu"]["common_requested_tau_gyroperiods"]))
+            requested_common_tau = Float64.(cfg[:common_requested_tau_gyroperiods])
+            length(stored_common_requested_tau) == length(requested_common_tau) || return false
+            all(isapprox.(stored_common_requested_tau, requested_common_tau; rtol=1.0e-10, atol=1.0e-12)) || return false
+        end
 
         requested_max_lag_steps = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
         return stored_start_mode == CombinedFullMod.dmumu_start_mode(cfg) &&
                stored_mu_bin_abs == CombinedFullMod.mu_bin_abs(cfg) &&
                stored_lag_mode == cfg[:lag_mode] &&
                stored_lag_range_policy == CombinedFullMod.normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed)) &&
+               stored_lag_common_scope == CombinedFullMod.normalize_lag_common_scope(get(cfg, :lag_common_scope, :campaign)) &&
                stored_lag_boundary_policy == CombinedFullMod.normalize_lag_boundary_policy(get(cfg, :lag_boundary_policy, :strict)) &&
                isapprox(stored_boundary_rel_error, Float64(get(cfg, :max_lag_boundary_relative_error, 0.0)); atol=0.0, rtol=0.0) &&
                stored_group_identity == String(get(cfg, :lag_comparison_group_identity, "not-applicable")) &&
+               stored_member_count == Int(get(cfg, :lag_group_member_count, 1)) &&
+               stored_member_modes == String(get(cfg, :lag_group_member_modes, "not-applicable")) &&
+               stored_member_energies == String(get(cfg, :lag_group_member_energies_GeV, "not-applicable")) &&
                stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
                stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
@@ -943,9 +1166,13 @@ function dpp_outputs_match_requested(path_h5::AbstractString, cfg)
         haskey(file, "source_cache_save_interval_gyroperiods") || return false
         stored_lag_mode = DppFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
         stored_lag_range_policy = DppFullMod.normalize_lag_range_policy(h5_scalar_string_or(file, "lag_range_policy", "fixed"))
+        stored_lag_common_scope = DppFullMod.normalize_lag_common_scope(h5_scalar_string_or(file, "lag_common_scope", "campaign"))
         stored_lag_boundary_policy = DppFullMod.normalize_lag_boundary_policy(h5_scalar_string_or(file, "lag_boundary_policy", "strict"))
         stored_boundary_rel_error = h5_scalar_float_or(file, "max_lag_boundary_relative_error", 0.0)
         stored_group_identity = h5_scalar_string_or(file, "lag_comparison_group_identity", "not-applicable")
+        stored_member_count = h5_scalar_int_or(file, "lag_group_member_count", 1)
+        stored_member_modes = h5_scalar_string_or(file, "lag_group_member_modes", "not-applicable")
+        stored_member_energies = h5_scalar_string_or(file, "lag_group_member_energies_GeV", "not-applicable")
         stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
         stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
         stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
@@ -954,12 +1181,23 @@ function dpp_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_lag_min_gp = h5_scalar_float_or(file, "lag_min_gyroperiods", nothing)
         stored_lag_max_gp = h5_scalar_float_or(file, "lag_max_gyroperiods", nothing)
         stored_lag_stride_gp = h5_scalar_float_or(file, "lag_stride_gyroperiods", nothing)
+        if haskey(cfg, :common_requested_tau_gyroperiods)
+            haskey(file["dpp"], "common_requested_tau_gyroperiods") || return false
+            stored_common_requested_tau = Float64.(read(file["dpp"]["common_requested_tau_gyroperiods"]))
+            requested_common_tau = Float64.(cfg[:common_requested_tau_gyroperiods])
+            length(stored_common_requested_tau) == length(requested_common_tau) || return false
+            all(isapprox.(stored_common_requested_tau, requested_common_tau; rtol=1.0e-10, atol=1.0e-12)) || return false
+        end
         requested_max_lag_steps = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
         return stored_lag_mode == cfg[:lag_mode] &&
                stored_lag_range_policy == DppFullMod.normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed)) &&
+               stored_lag_common_scope == DppFullMod.normalize_lag_common_scope(get(cfg, :lag_common_scope, :campaign)) &&
                stored_lag_boundary_policy == DppFullMod.normalize_lag_boundary_policy(get(cfg, :lag_boundary_policy, :strict)) &&
                isapprox(stored_boundary_rel_error, Float64(get(cfg, :max_lag_boundary_relative_error, 0.0)); atol=0.0, rtol=0.0) &&
                stored_group_identity == String(get(cfg, :lag_comparison_group_identity, "not-applicable")) &&
+               stored_member_count == Int(get(cfg, :lag_group_member_count, 1)) &&
+               stored_member_modes == String(get(cfg, :lag_group_member_modes, "not-applicable")) &&
+               stored_member_energies == String(get(cfg, :lag_group_member_energies_GeV, "not-applicable")) &&
                stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
                stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
@@ -1629,16 +1867,21 @@ function overall_product_status(dmumu_status::AbstractString, dpp_status::Abstra
     return "cache_only"
 end
 
-function run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
+function run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, energy_GeV; timing_plan=nothing)
     paths = build_energy_paths(cfg, energy_GeV)
     mkpath(paths.cache_dir)
     mkpath(paths.science_dir)
     requested_dmumu_cfg = merge_cfg(CombinedFullMod.COMBINED_FULL_CFG, cfg[:dmumu_overrides])
     requested_dpp_cfg = merge_cfg(DppFullMod.DPP_FULL_CFG, cfg[:dpp_overrides])
+    if timing_plan !== nothing
+        timing_plan.dmumu_cfg !== nothing && (requested_dmumu_cfg = merge_cfg(requested_dmumu_cfg, timing_plan.dmumu_cfg))
+        timing_plan.dpp_cfg !== nothing && (requested_dpp_cfg = merge_cfg(requested_dpp_cfg, timing_plan.dpp_cfg))
+    end
 
     println()
     println("=== Energy ", energy_GeV, " GeV ===")
     time_reference = resolve_energy_time_reference(base_runner_cfg, reference_fields, energy_GeV, cfg[:reference_h5])
+    assert_preflight_timing_matches(timing_plan, base_runner_cfg, fields, energy_GeV, time_reference)
     println("Energy:")
     println("  energy                         = ", energy_GeV, " GeV")
     println("  Omega0_reference               = ", time_reference.Omega0_reference_s_inv, " s^-1")
@@ -1864,19 +2107,7 @@ end
 
 function run_campaign(cfg)
     mkpath(cfg[:campaign_root])
-    base_runner_cfg = merge_cfg(
-        RunnerMod.CFG,
-        merge_cfg(
-            cfg[:trajectory_overrides],
-            Dict{Symbol, Any}(
-                :file => cfg[:turbulence_h5],
-                :trajectory_mode => cfg[:mode_name],
-                :trajectory_field_source_path => cfg[:turbulence_h5],
-                :trajectory_field_source_identity => cfg[:turbulence_h5],
-                :mu_cache_output_precision => cfg[:mu_cache_output_precision],
-            ),
-        ),
-    )
+    base_runner_cfg = campaign_base_runner_cfg(cfg)
 
     println("Campaign ", cfg[:campaign_tag])
     println("  campaign root            = ", cfg[:campaign_root])
@@ -1896,13 +2127,25 @@ function run_campaign(cfg)
     reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => cfg[:reference_h5]))
     println("Loading total-field reference once for time normalization")
     reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
-    run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
+    if !haskey(cfg, :global_preflight_result)
+        @warn "run_campaign was called without a global preflight result; running campaign-local preflight fallback. Top-level run_mode_campaigns performs cross-mode preflight before execution."
+        local_plans = run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
+        local_jobs = Dict{String, Any}()
+        for plan in local_plans
+            job_id = transport_job_id(cfg, plan.energy_GeV)
+            local_jobs[job_id] = merge(plan, (job_id=job_id, reference_group_id=reference_group_id(cfg, base_runner_cfg), dmumu_cfg=nothing, dpp_cfg=nothing))
+        end
+        cfg[:global_preflight_result] = (jobs=local_jobs, groups=Dict{String, Any}(), job_order=collect(keys(local_jobs)))
+    end
 
     summary_rows = Any[]
     summary_path = joinpath(cfg[:campaign_root], "campaign_summary.tsv")
     for energy_GeV in cfg[:energies]
         try
-            row = run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
+            job_id = transport_job_id(cfg, energy_GeV)
+            timing_plan = get(cfg[:global_preflight_result].jobs, job_id, nothing)
+            timing_plan === nothing && error("Missing timing preflight plan for job " * job_id)
+            row = run_energy_pipeline!(cfg, fields, reference_fields, base_runner_cfg, energy_GeV; timing_plan=timing_plan)
             push!(summary_rows, row)
             write_summary(summary_path, summary_rows)
             if cfg[:stop_on_error] && row.status == "error"
@@ -2182,6 +2425,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:boundary, :compute_backend, :particle_selection, :injection_mode, :injection_position_mode, :injection_position_unit) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
     key == :lag_range_policy && return CombinedFullMod.normalize_lag_range_policy(value)
+    key == :lag_common_scope && return CombinedFullMod.normalize_lag_common_scope(value)
     key == :lag_boundary_policy && return CombinedFullMod.normalize_lag_boundary_policy(value)
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
     key == :mu_bin_abs && return config_bool(value, key_name)
@@ -2585,6 +2829,8 @@ function runtime_config()
             cfg[:dmumu_overrides][:lag_mode] = CombinedFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-lag-range-policy=")
             cfg[:dmumu_overrides][:lag_range_policy] = CombinedFullMod.normalize_lag_range_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-lag-common-scope=")
+            cfg[:dmumu_overrides][:lag_common_scope] = CombinedFullMod.normalize_lag_common_scope(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-lag-boundary-policy=")
             cfg[:dmumu_overrides][:lag_boundary_policy] = CombinedFullMod.normalize_lag_boundary_policy(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-max-lag-boundary-relative-error=")
@@ -2637,6 +2883,8 @@ function runtime_config()
             cfg[:dpp_overrides][:lag_mode] = DppFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-lag-range-policy=")
             cfg[:dpp_overrides][:lag_range_policy] = DppFullMod.normalize_lag_range_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-lag-common-scope=")
+            cfg[:dpp_overrides][:lag_common_scope] = DppFullMod.normalize_lag_common_scope(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-lag-boundary-policy=")
             cfg[:dpp_overrides][:lag_boundary_policy] = DppFullMod.normalize_lag_boundary_policy(split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-max-lag-boundary-relative-error=")
@@ -2696,12 +2944,14 @@ function runtime_config()
 end
 
 function run_mode_campaigns(cfg)
+    haskey(cfg, :global_preflight_result) || run_global_timing_preflight!(cfg)
     results = Dict{String, Any}()
     for campaign_spec in cfg[:mode_campaigns]
         println()
         println("=== Campaign ", campaign_spec[:campaign_tag], " ===")
         println("  input H5                 = ", campaign_spec[:turbulence_h5])
         campaign_cfg = materialize_campaign_cfg(cfg, campaign_spec)
+        campaign_cfg[:global_preflight_result] = cfg[:global_preflight_result]
         results[string(campaign_spec[:campaign_tag])] = run_campaign(campaign_cfg)
     end
     return results

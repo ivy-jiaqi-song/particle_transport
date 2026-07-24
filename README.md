@@ -267,6 +267,14 @@ prints a preflight report, and writes `timing_preflight.tsv` under the output
 root. If any lag policy cannot produce a valid grid, the run fails at this
 preflight stage before any trajectory starts.
 
+During this global preflight, the total-field-derived reference summary is cached
+per reference source, field subset, box geometry, B-field paths, and precision.
+The runner computes `B0_reference_T` and the reference grid identity once for a
+shared total reference, then reuses that summary for compatible total, Alfven,
+fast, and slow jobs instead of reloading the same large reference field arrays
+for every mode. Each trajectory field is still inspected for its own grid and CFL
+geometry.
+
 ## Campaign Examples
 
 Full repeat over all available modes and all configured energies:

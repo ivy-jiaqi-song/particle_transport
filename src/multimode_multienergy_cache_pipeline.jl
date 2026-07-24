@@ -624,6 +624,64 @@ function resolve_energy_time_reference(cfg, reference_fields, energy_GeV, refere
     )
 end
 
+function reference_preflight_cache_key(campaign_cfg, runner_cfg)
+    return join((
+        string(campaign_cfg[:reference_h5]),
+        string(get(runner_cfg, :field_subset, nothing)),
+        string(get(runner_cfg, :box_length_pc, nothing)),
+        string(get(runner_cfg, :B_paths, nothing)),
+        string(runner_cfg[:precision]),
+    ), "|")
+end
+
+function reference_preflight_summary_from_fields(campaign_cfg, reference_runner_cfg, reference_fields)
+    Bx, By, Bz = reference_fields[1], reference_fields[2], reference_fields[3]
+    return (
+        reference_h5 = String(campaign_cfg[:reference_h5]),
+        B0_reference_T = RunnerMod.reference_B0_T(Bx, By, Bz),
+        reference_grid_size = string(size(Bx)),
+        field_subset_identity = string(get(reference_runner_cfg, :field_subset, nothing)),
+        box_length_pc = Float64(get(reference_runner_cfg, :box_length_pc, NaN)),
+        source_identity = String(campaign_cfg[:reference_h5]),
+    )
+end
+
+function load_reference_preflight_summary(campaign_cfg, base_runner_cfg)
+    reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => campaign_cfg[:reference_h5]))
+    println("Preflight loading total reference fields for ", campaign_cfg[:reference_h5])
+    reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
+    return reference_preflight_summary_from_fields(campaign_cfg, reference_runner_cfg, reference_fields)
+end
+
+function get_reference_preflight_summary!(reference_cache, campaign_cfg, base_runner_cfg; loaded_fields=nothing)
+    key = reference_preflight_cache_key(campaign_cfg, base_runner_cfg)
+    if !haskey(reference_cache, key)
+        if loaded_fields !== nothing && normpath(String(base_runner_cfg[:file])) == normpath(String(campaign_cfg[:reference_h5]))
+            println("Preflight deriving total reference summary from already-loaded trajectory fields for ", campaign_cfg[:reference_h5])
+            reference_cache[key] = reference_preflight_summary_from_fields(campaign_cfg, base_runner_cfg, loaded_fields)
+        else
+            reference_cache[key] = load_reference_preflight_summary(campaign_cfg, base_runner_cfg)
+        end
+    else
+        println("Preflight reusing total reference summary for ", campaign_cfg[:reference_h5])
+    end
+    return reference_cache[key]
+end
+
+function time_reference_from_summary(cfg, reference_summary, energy_GeV)
+    T = cfg[:precision]
+    gamma0 = RunnerMod.energy_to_gamma(energy_GeV, T)
+    Omega0 = RunnerMod.reference_Omega0(reference_summary.B0_reference_T, gamma0, RunnerMod.Q_E, RunnerMod.M_P)
+    return RunnerMod.campaign_time_reference(
+        reference_summary.B0_reference_T,
+        Omega0;
+        source_mode="total",
+        source_path=reference_summary.reference_h5,
+        source_identity=reference_summary.source_identity,
+        field_subset=get(cfg, :field_subset, nothing),
+    )
+end
+
 function expected_time_resolution(cfg, fields, energy_GeV, time_reference)
     T = cfg[:precision]
     Bx, By, Bz = fields[1], fields[2], fields[3]
@@ -641,8 +699,8 @@ function predicted_cache_axis_gyroperiods(trajectory_time, save_time)
     return [Float64(index - 1) * trajectory_time.dt_gyroperiods for index in save_indices]
 end
 
-function resolved_job_timing(cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
-    time_reference = resolve_energy_time_reference(base_runner_cfg, reference_fields, energy_GeV, cfg[:reference_h5])
+function resolved_job_timing(cfg, fields, reference_summary, base_runner_cfg, energy_GeV)
+    time_reference = time_reference_from_summary(base_runner_cfg, reference_summary, energy_GeV)
     trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(base_runner_cfg, fields, energy_GeV, time_reference)
     t_gyroperiods = predicted_cache_axis_gyroperiods(trajectory_time, save_time)
     cache = RunnerMod.lag_cache_summary(t_gyroperiods)
@@ -670,78 +728,6 @@ function resolved_job_timing(cfg, fields, reference_fields, base_runner_cfg, ene
     )
 end
 
-function lag_preflight_group_identity(cfg, analysis_label::AbstractString)
-    return join((cfg[:campaign_tag], cfg[:mode_name], cfg[:reference_h5], cache_mode_label(cfg[:cache_mode]), analysis_label), "|")
-end
-
-function apply_common_lag_range!(analysis_cfg, timing_plans, cfg, analysis_label::AbstractString)
-    if CombinedFullMod.normalize_lag_range_policy(get(analysis_cfg, :lag_range_policy, :fixed)) == :common_cache_intersection
-        common_min = maximum(plan.cache_lag_min_gyroperiods for plan in timing_plans)
-        common_max = minimum(plan.cache_lag_max_gyroperiods for plan in timing_plans)
-        common_max > common_min || error(analysis_label * " common-cache-intersection has no positive lag overlap for campaign " * string(cfg[:campaign_tag]))
-        analysis_cfg[:common_cache_lag_min_gyroperiods] = common_min
-        analysis_cfg[:common_cache_lag_max_gyroperiods] = common_max
-        analysis_cfg[:lag_comparison_group_identity] = lag_preflight_group_identity(cfg, analysis_label)
-    end
-    analysis_cfg[:analysis_label] = analysis_label
-    return analysis_cfg
-end
-
-function print_timing_preflight_report(cfg, timing_plans, dmumu_cfg, dpp_cfg)
-    println("Timing preflight:")
-    println("Energy [GeV]\tLimiter\tRequested cache dt/Tg0\tActual cache dt/Tg0\tCache lag range/Tg0")
-    for plan in timing_plans
-        println(join((
-            @sprintf("%.6g", plan.energy_GeV),
-            plan.timestep_limited_by,
-            @sprintf("%.12g", plan.requested_save_interval_gyroperiods),
-            @sprintf("%.12g", plan.actual_save_interval_gyroperiods),
-            "[" * @sprintf("%.12g", plan.cache_lag_min_gyroperiods) * ", " * @sprintf("%.12g", plan.cache_lag_max_gyroperiods) * "]",
-        ), '\t'))
-    end
-    for (label, analysis_cfg) in (("D_mumu", dmumu_cfg), ("D_pp", dpp_cfg))
-        analysis_cfg === nothing && continue
-        range_policy = CombinedFullMod.normalize_lag_range_policy(get(analysis_cfg, :lag_range_policy, :fixed))
-        common_min = get(analysis_cfg, :common_cache_lag_min_gyroperiods, NaN)
-        common_max = get(analysis_cfg, :common_cache_lag_max_gyroperiods, NaN)
-        first_grid = CombinedFullMod.resolve_lag_grid(analysis_cfg, first(timing_plans).t_gyroperiods)
-        println(label * " preflight:")
-        println("  configured range              = ", get(analysis_cfg, :lag_min_gyroperiods, nothing), " to ", get(analysis_cfg, :lag_max_gyroperiods, nothing), " reference gyroperiods")
-        if range_policy == :common_cache_intersection
-            println("  common representable range    = ", common_min, " to ", common_max, " reference gyroperiods")
-        end
-        println("  effective range               = ", first_grid.effective_lag_min_gyroperiods, " to ", first_grid.effective_lag_max_gyroperiods, " reference gyroperiods")
-        println("  boundary policy               = ", first_grid.lag_boundary_policy)
-        println("  expected requested lag count  = ", first_grid.requested_lag_count)
-    end
-    return nothing
-end
-
-function run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
-    timing_plans = [resolved_job_timing(cfg, fields, reference_fields, base_runner_cfg, energy_GeV) for energy_GeV in cfg[:energies]]
-    dmumu_cfg = cfg[:compute_dmumu] ? merge_cfg(CombinedFullMod.COMBINED_FULL_CFG, cfg[:dmumu_overrides]) : nothing
-    dpp_cfg = cfg[:compute_dpp] ? merge_cfg(DppFullMod.DPP_FULL_CFG, cfg[:dpp_overrides]) : nothing
-    dmumu_cfg !== nothing && apply_common_lag_range!(dmumu_cfg, timing_plans, cfg, "D_mumu")
-    dpp_cfg !== nothing && apply_common_lag_range!(dpp_cfg, timing_plans, cfg, "D_pp")
-    for plan in timing_plans
-        dmumu_cfg !== nothing && CombinedFullMod.resolve_lag_grid(dmumu_cfg, plan.t_gyroperiods)
-        dpp_cfg !== nothing && DppFullMod.resolve_lag_grid(dpp_cfg, plan.t_gyroperiods)
-    end
-    if dmumu_cfg !== nothing
-        for key in (:common_cache_lag_min_gyroperiods, :common_cache_lag_max_gyroperiods, :lag_comparison_group_identity, :analysis_label)
-            haskey(dmumu_cfg, key) && (cfg[:dmumu_overrides][key] = dmumu_cfg[key])
-        end
-    end
-    if dpp_cfg !== nothing
-        for key in (:common_cache_lag_min_gyroperiods, :common_cache_lag_max_gyroperiods, :lag_comparison_group_identity, :analysis_label)
-            haskey(dpp_cfg, key) && (cfg[:dpp_overrides][key] = dpp_cfg[key])
-        end
-    end
-    cfg[:timing_preflight_by_energy] = Dict(plan.energy_GeV => plan for plan in timing_plans)
-    print_timing_preflight_report(cfg, timing_plans, dmumu_cfg, dpp_cfg)
-    return timing_plans
-end
-
 function campaign_base_runner_cfg(campaign_cfg)
     return merge_cfg(
         RunnerMod.CFG,
@@ -767,12 +753,14 @@ function timing_identity_string(runner_cfg)
     return join([string(key) * "=" * string(get(runner_cfg, key, nothing)) for key in keys], ";")
 end
 
-function reference_group_id(campaign_cfg, runner_cfg, fields=nothing)
-    grid_size = fields === nothing ? "unknown" : string(size(fields[1]))
+function reference_group_id(campaign_cfg, runner_cfg, fields=nothing, reference_summary=nothing)
+    trajectory_grid_size = fields === nothing ? "unknown" : string(size(fields[1]))
+    reference_grid_size = reference_summary === nothing ? "unknown" : reference_summary.reference_grid_size
     parts = (
         "reference=" * string(campaign_cfg[:reference_h5]),
         "field_subset=" * string(get(runner_cfg, :field_subset, nothing)),
-        "grid_size=" * grid_size,
+        "reference_grid_size=" * reference_grid_size,
+        "trajectory_grid_size=" * trajectory_grid_size,
         "box_length_pc=" * string(get(runner_cfg, :box_length_pc, nothing)),
         "particle_species=proton",
         "timing=" * timing_identity_string(runner_cfg),
@@ -877,18 +865,17 @@ end
 function run_global_timing_preflight!(cfg)
     job_plans = Any[]
     campaign_cfgs = Dict{String, Any}()
+    reference_cache = Dict{String, Any}()
     for campaign_spec in cfg[:mode_campaigns]
         campaign_cfg = materialize_campaign_cfg(cfg, campaign_spec)
         base_runner_cfg = campaign_base_runner_cfg(campaign_cfg)
         println("Preflight loading trajectory fields for ", campaign_cfg[:campaign_tag])
         fields = RunnerMod.load_static_fields(base_runner_cfg, base_runner_cfg[:precision])
-        reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => campaign_cfg[:reference_h5]))
-        println("Preflight loading total reference fields for ", campaign_cfg[:campaign_tag])
-        reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
+        reference_summary = get_reference_preflight_summary!(reference_cache, campaign_cfg, base_runner_cfg; loaded_fields=fields)
         campaign_cfgs[String(campaign_cfg[:campaign_tag])] = campaign_cfg
         for energy_GeV in campaign_cfg[:energies]
-            plan = resolved_job_timing(campaign_cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
-            ref_group = reference_group_id(campaign_cfg, base_runner_cfg, fields)
+            plan = resolved_job_timing(campaign_cfg, fields, reference_summary, base_runner_cfg, energy_GeV)
+            ref_group = reference_group_id(campaign_cfg, base_runner_cfg, fields, reference_summary)
             job_id = transport_job_id(campaign_cfg, energy_GeV)
             push!(job_plans, merge(plan, (job_id=job_id, reference_group_id=ref_group)))
         end
@@ -2127,16 +2114,7 @@ function run_campaign(cfg)
     reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => cfg[:reference_h5]))
     println("Loading total-field reference once for time normalization")
     reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
-    if !haskey(cfg, :global_preflight_result)
-        @warn "run_campaign was called without a global preflight result; running campaign-local preflight fallback. Top-level run_mode_campaigns performs cross-mode preflight before execution."
-        local_plans = run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
-        local_jobs = Dict{String, Any}()
-        for plan in local_plans
-            job_id = transport_job_id(cfg, plan.energy_GeV)
-            local_jobs[job_id] = merge(plan, (job_id=job_id, reference_group_id=reference_group_id(cfg, base_runner_cfg), dmumu_cfg=nothing, dpp_cfg=nothing))
-        end
-        cfg[:global_preflight_result] = (jobs=local_jobs, groups=Dict{String, Any}(), job_order=collect(keys(local_jobs)))
-    end
+    haskey(cfg, :global_preflight_result) || error("run_campaign requires a global timing preflight result. Use run_mode_campaigns so all selected jobs are preflighted before execution.")
 
     summary_rows = Any[]
     summary_path = joinpath(cfg[:campaign_root], "campaign_summary.tsv")

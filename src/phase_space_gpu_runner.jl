@@ -4,6 +4,7 @@ using Random
 using Statistics
 
 include(joinpath(@__DIR__, "time_units.jl"))
+include(joinpath(@__DIR__, "gpu_async_cache_writer.jl"))
 
 const C_LIGHT = 2.99792458e8
 const Q_E = 1.602176634e-19
@@ -31,7 +32,7 @@ const CFG = Dict{Symbol, Any}(
     :seed => 42,
     :energies => [1e5],
     :n_particles => 100000,
-    :precision => Float64,
+    :precision => Float32,
     :field_subset => nothing,
     :boundary => :periodic,   # :open or :periodic
     :trajectory_mode => :total,
@@ -44,6 +45,8 @@ const CFG = Dict{Symbol, Any}(
     :trajectory_time_stride => 1,
     :trajectory_save_interval_gyroperiods => nothing,
     :trajectory_output_precision => Float32,
+    :async_cache_writer => true,
+    :cache_writer_buffer_count => 2,
     :progress_every => 5000,
     :output_dir => DEFAULT_OUTPUT_DIR,
 )
@@ -390,6 +393,75 @@ function advance_particles_kernel!(x1_step, x2_step, x3_step, p1_step, p2_step, 
     return
 end
 
+function advance_particles_inplace_kernel!(x1, x2, x3, p1, p2, p3, alive, alive_count, Bx, By, Bz, vx, vy, vz, dt, xmin, ymin, zmin, xmax, ymax, zmax, dx, dy, dz, nx, ny, nz, periodic_boundary)
+    p = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    npart = length(alive)
+    p > npart && return
+    alive[p] || return
+
+    xx = x1[p]
+    yy = x2[p]
+    zz = x3[p]
+    bx = trilinear_sample(Bx, xx, yy, zz, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    by = trilinear_sample(By, xx, yy, zz, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    bz = trilinear_sample(Bz, xx, yy, zz, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    vfx = trilinear_sample(vx, xx, yy, zz, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    vfy = trilinear_sample(vy, xx, yy, zz, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    vfz = trilinear_sample(vz, xx, yy, zz, xmin, ymin, zmin, dx, dy, dz, nx, ny, nz)
+    ex, ey, ez = cross3(vfx, vfy, vfz, bx, by, bz)
+    ex = -ex
+    ey = -ey
+    ez = -ez
+
+    p1n, p2n, p3n, x1n, x2n, x3n = boris_push(p1[p], p2[p], p3[p], xx, yy, zz, ex, ey, ez, bx, by, bz, dt)
+    if periodic_boundary
+        x1n = wrap_periodic_coordinate(x1n, xmin, xmax)
+        x2n = wrap_periodic_coordinate(x2n, ymin, ymax)
+        x3n = wrap_periodic_coordinate(x3n, zmin, zmax)
+    end
+
+    p1[p] = p1n
+    p2[p] = p2n
+    p3[p] = p3n
+    x1[p] = x1n
+    x2[p] = x2n
+    x3[p] = x3n
+
+    if !periodic_boundary && (x1n < xmin || x1n > xmax || x2n < ymin || x2n > ymax || x3n < zmin || x3n > zmax)
+        alive[p] = false
+        CUDA.@atomic alive_count[1] -= Int32(1)
+    end
+    return
+end
+
+function pack_phase_space_kernel!(packed, x1, x2, x3, p1, p2, p3, alive)
+    p = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    npart = length(alive)
+    p > npart && return
+    Tout = eltype(packed)
+    if alive[p]
+        @inbounds begin
+            packed[p, 1] = Tout(x1[p])
+            packed[p, 2] = Tout(x2[p])
+            packed[p, 3] = Tout(x3[p])
+            packed[p, 4] = Tout(p1[p])
+            packed[p, 5] = Tout(p2[p])
+            packed[p, 6] = Tout(p3[p])
+        end
+    else
+        value = Tout(NaN)
+        @inbounds begin
+            packed[p, 1] = value
+            packed[p, 2] = value
+            packed[p, 3] = value
+            packed[p, 4] = value
+            packed[p, 5] = value
+            packed[p, 6] = value
+        end
+    end
+    return
+end
+
 function sampled_step_indices(nsteps::Integer, stride::Integer)
     stride < 1 && error("trajectory_time_stride must be >= 1")
     return collect(1:stride:nsteps)
@@ -420,7 +492,18 @@ function write_phase_space_step!(writer, save_idx::Integer, x1_step, x2_step, x3
     writer.momenta[:, 3, save_idx] = Tout.(p3_step)
 end
 
+function write_phase_space_packed_step!(writer, save_idx::Integer, packed)
+    writer.positions[:, 1, save_idx] = packed[:, 1]
+    writer.positions[:, 2, save_idx] = packed[:, 2]
+    writer.positions[:, 3, save_idx] = packed[:, 3]
+    writer.momenta[:, 1, save_idx] = packed[:, 4]
+    writer.momenta[:, 2, save_idx] = packed[:, 5]
+    writer.momenta[:, 3, save_idx] = packed[:, 6]
+    return nothing
+end
+
 function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, time_reference)
+    (haskey(writer, :async) && writer.async) && finish_async_phase_space_writer!(writer)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
@@ -439,6 +522,13 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     file["trajectory_field_source_identity"] = string(get(cfg, :trajectory_field_source_identity, get(cfg, :trajectory_field_source_path, cfg[:file])))
     file["boundary_mode"] = string(cfg[:boundary])
     file["trajectory_output_precision"] = string(writer.outtype)
+    file["state_precision"] = string(cfg[:precision])
+    file["packed_transfer_component_order"] = "x,y,z,px,py,pz"
+    file["async_cache_writer_enabled"] = Bool(haskey(writer, :async) && writer.async)
+    file["cache_writer_buffer_count"] = Int(haskey(writer, :buffer_count) ? writer.buffer_count : 1)
+    file["cache_transfer_count_per_state"] = 1
+    file["cache_transfer_layout"] = "packed_particle_component_matrix"
+    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_async_cache_writer_v1" : "sync_phase_space_writer_v1"
     file["position_unit"] = "m"
     file["momentum_unit"] = "kg*m/s"
     write_injection_metadata!(file, cfg)
@@ -526,14 +616,10 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference)
     dy = y[2] - y[1]
     dz = z[2] - z[1]
 
-    dx1_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dx2_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dx3_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dp1_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dp2_step = CUDA.fill(T(NaN), cfg[:n_particles])
-    dp3_step = CUDA.fill(T(NaN), cfg[:n_particles])
+    dpacked_step = CUDA.fill(trajectory_out_type(NaN), cfg[:n_particles], 6)
+    dalive_count = CuArray(Int32[cfg[:n_particles]])
 
-    alive_fraction = Vector{Float64}(undef, nsteps)
+    alive_fraction = fill(NaN, nsteps)
     phase_space_gib = bytes_to_gib(estimate_phase_space_bytes(cfg[:n_particles], nsave, trajectory_out_type))
 
     threads = 256
@@ -556,7 +642,9 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference)
     elapsed = NaN
     writer = nothing
     try
-        writer = create_phase_space_writer(output_paths(cfg, energy_GeV).h5, cfg[:n_particles], nsave, trajectory_out_type)
+        writer = Bool(get(cfg, :async_cache_writer, true)) ?
+            create_async_phase_space_writer(output_paths(cfg, energy_GeV).h5, cfg[:n_particles], nsave, trajectory_out_type, Int(get(cfg, :cache_writer_buffer_count, 2))) :
+            create_phase_space_writer(output_paths(cfg, energy_GeV).h5, cfg[:n_particles], nsave, trajectory_out_type)
 
         elapsed = @elapsed begin
             next_save_ptr = 1
@@ -565,31 +653,29 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference)
                     println("Energy ", energy_GeV, " GeV: step ", si, "/", nsteps)
                 end
 
-                do_push = si < nsteps
-                @cuda threads=threads blocks=blocks advance_particles_kernel!(
-                    dx1_step, dx2_step, dx3_step, dp1_step, dp2_step, dp3_step,
-                    dx1, dx2, dx3, dp1, dp2, dp3, dalive,
-                    dBx, dBy, dBz, dvx, dvy, dvz,
-                    dt, xmin, ymin, zmin, xmax, ymax, zmax, dx, dy, dz, nx, ny, nz, do_push, periodic_boundary
-                )
-
-                alive_fraction[si] = Float64(sum(dalive)) / Float64(cfg[:n_particles])
-
                 if next_save_ptr <= nsave && si == save_indices[next_save_ptr]
-                    write_phase_space_step!(
-                        writer,
-                        next_save_ptr,
-                        Array(dx1_step),
-                        Array(dx2_step),
-                        Array(dx3_step),
-                        Array(dp1_step),
-                        Array(dp2_step),
-                        Array(dp3_step),
-                    )
+                    alive_fraction[si] = Float64(Array(dalive_count)[1]) / Float64(cfg[:n_particles])
+                    if haskey(writer, :async) && writer.async
+                        enqueue_phase_space_step!(writer, next_save_ptr, alive_fraction[si]) do slot_buffer
+                            @cuda threads=threads blocks=blocks pack_phase_space_kernel!(slot_buffer, dx1, dx2, dx3, dp1, dp2, dp3, dalive)
+                        end
+                    else
+                        @cuda threads=threads blocks=blocks pack_phase_space_kernel!(dpacked_step, dx1, dx2, dx3, dp1, dp2, dp3, dalive)
+                        write_phase_space_packed_step!(writer, next_save_ptr, Array(dpacked_step))
+                    end
                     next_save_ptr += 1
+                end
+
+                if si < nsteps
+                    @cuda threads=threads blocks=blocks advance_particles_inplace_kernel!(
+                        dx1, dx2, dx3, dp1, dp2, dp3, dalive, dalive_count,
+                        dBx, dBy, dBz, dvx, dvy, dvz,
+                        dt, xmin, ymin, zmin, xmax, ymax, zmax, dx, dy, dz, nx, ny, nz, periodic_boundary
+                    )
                 end
             end
             CUDA.synchronize()
+            alive_fraction[end] = Float64(Array(dalive_count)[1]) / Float64(cfg[:n_particles])
         end
 
         finalize_phase_space_writer!(

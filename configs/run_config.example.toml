@@ -89,10 +89,12 @@ injection_mu0 = 0.0
 # Ensemble and trajectory-cache burden settings.
 seed = 42
 n_particles = 100000
-precision = "Float64"
+precision = "Float32"
 field_subset = []
 trajectory_save_interval_gyroperiods = 0.015915494309189534
 trajectory_output_precision = "Float32"
+async_cache_writer = true
+cache_writer_buffer_count = 2
 progress_every = 5000
 
 [dmumu]
@@ -104,9 +106,13 @@ particles = "sample"
 B_paths = ["i_mag_field", "j_mag_field", "k_mag_field"]
 box_length_pc = 200.0
 field_subset = []
-compute_backend = "auto"
+compute_backend = "gpu"
 compute_precision = "Float32"
+accumulator_precision = "Float32"
 gpu_threads = 256
+gpu_lag_batch_size = 4
+gpu_memory_fraction = 0.75
+gpu_pipeline_buffers = 2
 
 # D_mumu estimator mode.
 # "sliding": bin by mu(t), use Delta mu = mu(t + tau) - mu(t) over all valid start times.
@@ -152,6 +158,13 @@ use_usetex = false
 # Global D_pp uses scalar p = sqrt(px^2 + py^2 + pz^2) from the phase-space
 # cache. These controls are independent from [dmumu]; [particles] still controls
 # the generated physical ensemble and trajectory parameters shared by both.
+compute_backend = "gpu"
+compute_precision = "Float32"
+accumulator_precision = "Float32"
+gpu_threads = 256
+gpu_lag_batch_size = 4
+gpu_memory_fraction = 0.75
+gpu_pipeline_buffers = 2
 particle_chunk_size = 128
 first_particle = 1
 n_particles_to_use = 10000
@@ -168,3 +181,5 @@ n_lag_samples = 40
 lag_max_gyroperiods = 795.7747154594767
 lag_stride_gyroperiods = 0.015915494309189534
 n_energy_snapshots = 5
+n_energy_bins = 64
+save_raw_energy_snapshots = false

@@ -123,8 +123,9 @@ The current public config layout is:
     GPU runs use `compute_precision`, `gpu_threads`, `gpu_lag_batch_size`, and
     `gpu_memory_fraction` to control device work.
   - The GPU backend processes lag batches and keeps campaign accumulators on the
-    device until the final compact result copy. `accumulator_precision` defaults
-    to `Float32` for the GPU production path.
+    device until the final compact result copy. GPU accumulator arrays are fixed
+    to `Float32` in this implementation; use the CPU backend for Float64
+    reference accumulation.
   - `mu_bin_abs = true` bins D_mumu by `abs(mu_start)` over `mu_min = 0.0` to
     `mu_max = 1.0`; stored `mu` values and `Delta mu` remain signed.
 

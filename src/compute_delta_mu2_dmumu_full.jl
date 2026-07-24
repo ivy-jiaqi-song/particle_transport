@@ -14,7 +14,6 @@ const COMBINED_FULL_CFG = Dict{Symbol, Any}(
     :field_subset => nothing,
     :compute_backend => :gpu,
     :compute_precision => Float32,
-    :accumulator_precision => Float32,
     :gpu_threads => 256,
     :gpu_lag_batch_size => 4,
     :gpu_memory_fraction => 0.75,
@@ -724,7 +723,7 @@ end
     return raw
 end
 
-function dmumu_particle_partials_kernel!(partial_counts, partial_sum_delta, partial_sum_delta2, particle_pair_counts, particle_sumsq, mu, lag_steps, mu_minimum, mu_maximum, inv_bin_width, n_bins::Int32, start_mode_code::Int32, bin_abs::Bool)
+function dmumu_particle_partials_kernel!(partial_counts, partial_sum_delta, partial_sum_delta2, particle_pair_counts, particle_sumsq_output, mu, lag_steps, mu_minimum, mu_maximum, inv_bin_width, n_bins::Int32, start_mode_code::Int32, bin_abs::Bool)
     index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
     nsteps = size(mu, 1)
@@ -738,7 +737,7 @@ function dmumu_particle_partials_kernel!(partial_counts, partial_sum_delta, part
         particle = ((index - 1) ÷ n_lags) + 1
         lag_step = Int(lag_steps[lag_index])
 
-        particle_sumsq = zero(T)
+        local_particle_sumsq = zero(T)
         valid_pair_count = Int32(0)
         if lag_step < nsteps
             if start_mode_code == Int32(1)
@@ -753,7 +752,7 @@ function dmumu_particle_partials_kernel!(partial_counts, partial_sum_delta, part
                         partial_sum_delta[bin_index, lag_index, particle] += delta_mu
                         partial_sum_delta2[bin_index, lag_index, particle] += delta_mu2
                     end
-                    particle_sumsq = delta_mu2
+                    local_particle_sumsq = delta_mu2
                     valid_pair_count = Int32(1)
                 end
             else
@@ -770,7 +769,7 @@ function dmumu_particle_partials_kernel!(partial_counts, partial_sum_delta, part
                             partial_sum_delta[bin_index, lag_index, particle] += delta_mu
                             partial_sum_delta2[bin_index, lag_index, particle] += delta_mu2
                         end
-                        particle_sumsq += delta_mu2
+                        local_particle_sumsq += delta_mu2
                         valid_pair_count += Int32(1)
                     end
                 end
@@ -779,14 +778,24 @@ function dmumu_particle_partials_kernel!(partial_counts, partial_sum_delta, part
 
         if valid_pair_count > 0
             particle_pair_counts[lag_index, particle] = valid_pair_count
-            particle_sumsq[lag_index, particle] = particle_sumsq
+            particle_sumsq_output[lag_index, particle] = local_particle_sumsq
         end
         index += stride
     end
     return
 end
 
-function dmumu_reduce_partials_kernel!(campaign_counts, campaign_sum_delta, campaign_sum_delta2, campaign_particle_counts, campaign_particle_sum, campaign_particle_sum2, campaign_pair_sum_squares, campaign_pair_counts, partial_counts, partial_sum_delta, partial_sum_delta2, particle_pair_counts, particle_sumsq, lag_offset::Int32)
+@inline function welford_merge_count_mean_m2(n_a::Int64, mean_a, m2_a, n_b::Int64, mean_b, m2_b)
+    n_b <= 0 && return n_a, mean_a, m2_a
+    n_a <= 0 && return n_b, mean_b, m2_b
+    n = n_a + n_b
+    delta = mean_b - mean_a
+    mean = mean_a + delta * (typeof(mean_a)(n_b) / typeof(mean_a)(n))
+    m2 = m2_a + m2_b + delta * delta * (typeof(mean_a)(n_a) * typeof(mean_a)(n_b) / typeof(mean_a)(n))
+    return n, mean, m2
+end
+
+function dmumu_reduce_partials_kernel!(campaign_counts, campaign_sum_delta, campaign_sum_delta2, campaign_pair_sum_squares, campaign_pair_counts, partial_counts, partial_sum_delta, partial_sum_delta2, particle_pair_counts, particle_sumsq, lag_offset::Int32)
     index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
     n_bins = size(partial_counts, 1)
@@ -807,22 +816,40 @@ function dmumu_reduce_partials_kernel!(campaign_counts, campaign_sum_delta, camp
         index += stride
     end
 
-    index2 = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    total_particles = n_lags * n_particles
-    while index2 <= total_particles
-        local_lag = ((index2 - 1) % n_lags) + 1
-        particle = ((index2 - 1) ÷ n_lags) + 1
-        count = particle_pair_counts[local_lag, particle]
-        if count > Int32(0)
-            lag_index = Int(lag_offset) + local_lag - 1
-            value = particle_sumsq[local_lag, particle] / Float32(count)
-            CUDA.@atomic campaign_particle_counts[lag_index] += Int64(1)
-            CUDA.@atomic campaign_particle_sum[lag_index] += value
-            CUDA.@atomic campaign_particle_sum2[lag_index] += value * value
-            CUDA.@atomic campaign_pair_sum_squares[lag_index] += particle_sumsq[local_lag, particle]
-            CUDA.@atomic campaign_pair_counts[lag_index] += Int64(count)
+    return
+end
+
+function dmumu_reduce_particle_welford_kernel!(campaign_particle_counts, campaign_particle_means, campaign_particle_m2s, campaign_pair_sum_squares, campaign_pair_counts, particle_pair_counts, particle_sumsq, lag_offset::Int32)
+    local_lag = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    n_lags = size(particle_pair_counts, 1)
+    local_lag > n_lags && return
+    n_particles = size(particle_pair_counts, 2)
+    T = eltype(campaign_particle_means)
+    local_count = Int64(0)
+    local_mean = zero(T)
+    local_m2 = zero(T)
+    local_pair_sumsq = zero(T)
+    local_pair_count = Int64(0)
+    @inbounds for particle in 1:n_particles
+        pair_count = particle_pair_counts[local_lag, particle]
+        if pair_count > Int32(0)
+            value = T(particle_sumsq[local_lag, particle]) / T(pair_count)
+            local_count, local_mean, local_m2 = welford_merge_count_mean_m2(local_count, local_mean, local_m2, Int64(1), value, zero(T))
+            local_pair_sumsq += T(particle_sumsq[local_lag, particle])
+            local_pair_count += Int64(pair_count)
         end
-        index2 += stride
+    end
+    if local_count > 0
+        lag_index = Int(lag_offset) + local_lag - 1
+        old_count = campaign_particle_counts[lag_index]
+        old_mean = campaign_particle_means[lag_index]
+        old_m2 = campaign_particle_m2s[lag_index]
+        new_count, new_mean, new_m2 = welford_merge_count_mean_m2(old_count, old_mean, old_m2, local_count, local_mean, local_m2)
+        campaign_particle_counts[lag_index] = new_count
+        campaign_particle_means[lag_index] = new_mean
+        campaign_particle_m2s[lag_index] = new_m2
+        campaign_pair_sum_squares[lag_index] += local_pair_sumsq
+        campaign_pair_counts[lag_index] += local_pair_count
     end
     return
 end
@@ -865,14 +892,21 @@ function process_mu_chunk_dmumu_gpu!(dmu_chunk, lag_steps::Vector{Int}, lag_rang
         gpu_accumulators.counts,
         gpu_accumulators.sum_delta,
         gpu_accumulators.sum_delta2,
-        gpu_accumulators.particle_counts,
-        gpu_accumulators.particle_sum,
-        gpu_accumulators.particle_sum2,
         gpu_accumulators.pair_sum_squares,
         gpu_accumulators.pair_counts,
         partial_counts,
         partial_sum_delta,
         partial_sum_delta2,
+        particle_pair_counts,
+        particle_sumsq,
+        Int32(first(lag_range)),
+    )
+    @cuda threads=threads blocks=cld(n_lags, threads) dmumu_reduce_particle_welford_kernel!(
+        gpu_accumulators.particle_counts,
+        gpu_accumulators.particle_means,
+        gpu_accumulators.particle_m2s,
+        gpu_accumulators.pair_sum_squares,
+        gpu_accumulators.pair_counts,
         particle_pair_counts,
         particle_sumsq,
         Int32(first(lag_range)),
@@ -886,8 +920,8 @@ function create_dmumu_gpu_accumulators(n_bins::Integer, n_lags::Integer)
         sum_delta = CUDA.zeros(Float32, n_bins, n_lags),
         sum_delta2 = CUDA.zeros(Float32, n_bins, n_lags),
         particle_counts = CUDA.zeros(Int64, n_lags),
-        particle_sum = CUDA.zeros(Float32, n_lags),
-        particle_sum2 = CUDA.zeros(Float32, n_lags),
+        particle_means = CUDA.zeros(Float32, n_lags),
+        particle_m2s = CUDA.zeros(Float32, n_lags),
         pair_sum_squares = CUDA.zeros(Float32, n_lags),
         pair_counts = CUDA.zeros(Int64, n_lags),
     )
@@ -898,17 +932,16 @@ function copy_dmumu_gpu_accumulators!(gpu_accumulators, particle_counts, particl
     dmumu_sum_delta .= Float64.(Array(gpu_accumulators.sum_delta))
     dmumu_sum_delta2 .= Float64.(Array(gpu_accumulators.sum_delta2))
     particle_count_values = Array(gpu_accumulators.particle_counts)
-    particle_sum_values = Array(gpu_accumulators.particle_sum)
-    particle_sum2_values = Array(gpu_accumulators.particle_sum2)
+    particle_mean_values = Array(gpu_accumulators.particle_means)
+    particle_m2_values = Array(gpu_accumulators.particle_m2s)
     pair_sum_squares .= Float64.(Array(gpu_accumulators.pair_sum_squares))
     pair_counts .= Array(gpu_accumulators.pair_counts)
     @inbounds for lag_index in eachindex(particle_counts)
         count = particle_count_values[lag_index]
         particle_counts[lag_index] = Int(count)
         if count > 0
-            mean_value = Float64(particle_sum_values[lag_index]) / count
-            particle_means[lag_index] = mean_value
-            particle_m2s[lag_index] = max(0.0, Float64(particle_sum2_values[lag_index]) - count * mean_value * mean_value)
+            particle_means[lag_index] = Float64(particle_mean_values[lag_index])
+            particle_m2s[lag_index] = max(0.0, Float64(particle_m2_values[lag_index]))
         end
     end
     return nothing
@@ -1045,11 +1078,20 @@ function save_combined_full_h5(
         file["requested_compute_backend"] = string(get(cfg, :compute_backend, backend))
         file["resolved_compute_backend"] = string(backend)
         file["compute_precision"] = string(cfg[:compute_precision])
-        file["accumulator_precision"] = string(get(cfg, :accumulator_precision, Float32))
+        file["accumulator_precision"] = "Float32"
         file["backend_version"] = backend == :gpu ? "gpu_dmumu_partial_reduce_v2" : "cpu_dmumu_reference_v1"
         file["gpu_lag_batch_size"] = Int(get(cfg, :resolved_gpu_lag_batch_size, get(cfg, :gpu_lag_batch_size, 1)))
+        file["requested_gpu_lag_batch_size"] = Int(get(cfg, :gpu_lag_batch_size, 1))
+        file["resolved_particle_chunk_size"] = Int(get(cfg, :resolved_particle_chunk_size, cfg[:particle_chunk_size]))
+        file["estimated_peak_gpu_memory"] = Int64(get(cfg, :estimated_peak_gpu_memory, 0))
+        file["usable_gpu_memory"] = Int64(get(cfg, :usable_gpu_memory, 0))
+        file["memory_planner_fallback_used"] = Bool(get(cfg, :memory_planner_fallback_used, false))
         file["gpu_memory_fraction"] = Float64(get(cfg, :gpu_memory_fraction, 1.0))
-        file["postprocess_pipeline_enabled"] = Bool(get(cfg, :gpu_pipeline_buffers, 1) >= 2 && backend == :gpu)
+        file["postprocess_pipeline_enabled"] = false
+        file["postprocess_pipeline_buffer_count"] = Int(get(cfg, :gpu_pipeline_buffers, 1))
+        file["postprocess_async_h2d_enabled"] = false
+        file["postprocess_transfer_stream_enabled"] = false
+        file["postprocess_compute_stream_enabled"] = false
         file["source_cache_uniform_time_axis"] = true
         file["source_cache_identity"] = string(cfg[:trajectory_h5])
         file["particle_chunk_size"] = Int(cfg[:particle_chunk_size])
@@ -1319,12 +1361,22 @@ function run_combined_full(cfg)
             cfg;
             particle_chunk_size=min(Int(cfg[:particle_chunk_size]), selected_particle_count),
             lag_count=n_lags,
-            n_bins=n_bins,
-            bytes_per_particle_lag=sizeof(Int32) + 3 * sizeof(Float32),
-            base_bytes=sizeof(Float32) * nsteps * min(Int(cfg[:particle_chunk_size]), selected_particle_count),
+            estimate_bytes=(chunk, lag_batch) -> begin
+                input_bytes = 6 * sizeof(T) * chunk * nsteps
+                mu_bytes = sizeof(T) * chunk * nsteps
+                lag_bytes = sizeof(Int32) * lag_batch
+                partial_hist_bytes = chunk * lag_batch * n_bins * (sizeof(Int32) + 2 * sizeof(T))
+                particle_partial_bytes = chunk * lag_batch * (sizeof(Int32) + sizeof(T))
+                campaign_bytes = n_lags * (n_bins * (sizeof(Int64) + 2 * sizeof(Float32)) + sizeof(Int64) * 2 + sizeof(Float32) * 3)
+                return input_bytes + mu_bytes + lag_bytes + partial_hist_bytes + particle_partial_bytes + campaign_bytes + Int64(64 * 1024^2)
+            end,
         ) : nothing
         backend == :gpu && print_gpu_work_plan("D_mumu", memory_plan)
         backend == :gpu && (cfg[:resolved_gpu_lag_batch_size] = memory_plan.lag_batch_size)
+        backend == :gpu && (cfg[:resolved_particle_chunk_size] = memory_plan.particle_chunk_size)
+        backend == :gpu && (cfg[:estimated_peak_gpu_memory] = memory_plan.estimated_peak_gpu_memory)
+        backend == :gpu && (cfg[:usable_gpu_memory] = memory_plan.usable_gpu_memory)
+        backend == :gpu && (cfg[:memory_planner_fallback_used] = memory_plan.memory_planner_fallback_used)
         chunk_size = backend == :gpu ? min(memory_plan.particle_chunk_size, selected_particle_count) : min(Int(cfg[:particle_chunk_size]), selected_particle_count)
         chunk_size > 0 || error("particle_chunk_size must be positive.")
         nchunks = cld(selected_particle_count, chunk_size)

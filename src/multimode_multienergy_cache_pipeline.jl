@@ -76,7 +76,6 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :field_subset => nothing,
         :compute_backend => :gpu,
         :compute_precision => Float32,
-        :accumulator_precision => Float32,
         :gpu_threads => 256,
         :gpu_lag_batch_size => 4,
         :gpu_memory_fraction => 0.75,
@@ -112,7 +111,6 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
     :dpp_overrides => Dict{Symbol, Any}(
         :compute_backend => :gpu,
         :compute_precision => Float32,
-        :accumulator_precision => Float32,
         :gpu_threads => 256,
         :gpu_lag_batch_size => 4,
         :gpu_memory_fraction => 0.75,
@@ -1366,10 +1364,14 @@ function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_sav
     file["cache_output_precision"] = string(writer.outtype)
     file["state_precision"] = string(cfg[:precision])
     file["async_cache_writer_enabled"] = Bool(haskey(writer, :async) && writer.async)
+    file["direct_d2h_enabled"] = Bool(haskey(writer, :direct_d2h) && writer.direct_d2h)
+    file["async_d2h_enabled"] = Bool(haskey(writer, :async_d2h) && writer.async_d2h)
+    file["cache_transfer_stream_enabled"] = Bool(haskey(writer, :transfer_stream) && writer.transfer_stream)
+    file["cache_compute_stream_enabled"] = Bool(haskey(writer, :compute_stream) && writer.compute_stream)
     file["cache_writer_buffer_count"] = Int(haskey(writer, :buffer_count) ? writer.buffer_count : 1)
     file["cache_transfer_count_per_state"] = 1
     file["cache_transfer_layout"] = "mu_vector"
-    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_async_cache_writer_v1" : "sync_mu_cache_writer_v1"
+    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_direct_d2h_hdf5_writer_v2" : "sync_mu_cache_writer_v1"
     file["mu_unit"] = "dimensionless"
     RunnerMod.write_injection_metadata!(file, cfg)
     close(file)
@@ -1727,9 +1729,14 @@ function run_combined_from_mu_cache(cfg)
             cfg;
             particle_chunk_size=min(Int(cfg[:particle_chunk_size]), selected_particle_count),
             lag_count=n_lags,
-            n_bins=n_bins,
-            bytes_per_particle_lag=sizeof(Int32) + 3 * sizeof(Float32),
-            base_bytes=sizeof(Float32) * nsteps * min(Int(cfg[:particle_chunk_size]), selected_particle_count),
+            estimate_bytes=(chunk, lag_batch) -> begin
+                input_bytes = sizeof(cfg[:compute_precision]) * chunk * nsteps
+                lag_bytes = sizeof(Int32) * lag_batch
+                partial_hist_bytes = chunk * lag_batch * n_bins * (sizeof(Int32) + 2 * sizeof(cfg[:compute_precision]))
+                particle_partial_bytes = chunk * lag_batch * (sizeof(Int32) + sizeof(cfg[:compute_precision]))
+                campaign_bytes = n_lags * (n_bins * (sizeof(Int64) + 2 * sizeof(Float32)) + sizeof(Int64) * 2 + sizeof(Float32) * 3)
+                return input_bytes + lag_bytes + partial_hist_bytes + particle_partial_bytes + campaign_bytes + Int64(64 * 1024^2)
+            end,
         ) : nothing
         backend == :gpu && CombinedFullMod.print_gpu_work_plan("D_mumu mu-cache", memory_plan)
         chunk_size = backend == :gpu ? min(memory_plan.particle_chunk_size, selected_particle_count) : min(Int(cfg[:particle_chunk_size]), selected_particle_count)
@@ -2464,7 +2471,7 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
     key == :injection_position && return config_tuple3_floats(value, key_name)
     key == :field_subset && return config_field_subset(value, key_name)
-    key in (:precision, :trajectory_output_precision, :compute_precision, :accumulator_precision) && return config_precision(value, key_name)
+    key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
     key in (:boundary, :compute_backend, :particle_selection, :injection_mode, :injection_position_mode, :injection_position_unit) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
     key == :lag_range_policy && return CombinedFullMod.normalize_lag_range_policy(value)

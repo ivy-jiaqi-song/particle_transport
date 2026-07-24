@@ -20,7 +20,6 @@ const DPP_FULL_CFG = Dict{Symbol, Any}(
     :cache_mode => :phase_space,
     :compute_backend => :gpu,
     :compute_precision => Float32,
-    :accumulator_precision => Float32,
     :gpu_threads => 256,
     :gpu_lag_batch_size => 4,
     :gpu_memory_fraction => 0.75,
@@ -644,11 +643,20 @@ function save_dpp_full_h5(path_h5::AbstractString, cfg, lag_steps, tau_s, tau_no
         file["resolved_compute_backend"] = string(resolved_backend)
         file["compute_precision"] = string(get(cfg, :compute_precision, Float32))
         file["backend_version"] = resolved_backend == :gpu ? "gpu_dpp_partial_reduce_v2" : "cpu_dpp_reference_v1"
-        file["accumulator_precision"] = string(get(cfg, :accumulator_precision, Float32))
+        file["accumulator_precision"] = "Float32"
         file["gpu_lag_batch_size"] = Int(get(cfg, :resolved_gpu_lag_batch_size, get(cfg, :gpu_lag_batch_size, 1)))
+        file["requested_gpu_lag_batch_size"] = Int(get(cfg, :gpu_lag_batch_size, 1))
+        file["resolved_particle_chunk_size"] = Int(get(cfg, :resolved_particle_chunk_size, cfg[:particle_chunk_size]))
+        file["estimated_peak_gpu_memory"] = Int64(get(cfg, :estimated_peak_gpu_memory, 0))
+        file["usable_gpu_memory"] = Int64(get(cfg, :usable_gpu_memory, 0))
+        file["memory_planner_fallback_used"] = Bool(get(cfg, :memory_planner_fallback_used, false))
         file["gpu_memory_fraction"] = Float64(get(cfg, :gpu_memory_fraction, 1.0))
         file["save_raw_energy_snapshots"] = Bool(get(cfg, :save_raw_energy_snapshots, false))
-        file["postprocess_pipeline_enabled"] = Bool(get(cfg, :gpu_pipeline_buffers, 1) >= 2 && resolved_backend == :gpu)
+        file["postprocess_pipeline_enabled"] = false
+        file["postprocess_pipeline_buffer_count"] = Int(get(cfg, :gpu_pipeline_buffers, 1))
+        file["postprocess_async_h2d_enabled"] = false
+        file["postprocess_transfer_stream_enabled"] = false
+        file["postprocess_compute_stream_enabled"] = false
         file["source_cache_uniform_time_axis"] = true
         file["source_cache_identity"] = string(get(cfg, :cache_h5, cfg[:trajectory_h5]))
         file["particle_chunk_size"] = Int(cfg[:particle_chunk_size])
@@ -810,12 +818,21 @@ function run_dpp_full(cfg)
             cfg;
             particle_chunk_size=chunk_size,
             lag_count=n_lags,
-            n_bins=1,
-            bytes_per_particle_lag=sizeof(Int64) + 4 * sizeof(Float32),
-            base_bytes=sizeof(Float32) * chunk_size * 3 * nsteps,
+            estimate_bytes=(chunk, lag_batch) -> begin
+                input_bytes = sizeof(Float32) * chunk * 3 * nsteps
+                lag_bytes = sizeof(Int32) * lag_batch
+                partial_bytes = chunk * lag_batch * (sizeof(Int64) + 4 * sizeof(Float32))
+                campaign_bytes = n_lags * (sizeof(Int64) + 4 * sizeof(Float32))
+                histogram_bytes = length(snapshot_indices) * n_energy_bins * sizeof(Int64) + 2 * length(snapshot_indices) * sizeof(Float32)
+                return input_bytes + lag_bytes + partial_bytes + campaign_bytes + histogram_bytes + Int64(64 * 1024^2)
+            end,
         ) : nothing
         backend == :gpu && print_gpu_work_plan("D_pp", memory_plan)
         backend == :gpu && (cfg[:resolved_gpu_lag_batch_size] = memory_plan.lag_batch_size)
+        backend == :gpu && (cfg[:resolved_particle_chunk_size] = memory_plan.particle_chunk_size)
+        backend == :gpu && (cfg[:estimated_peak_gpu_memory] = memory_plan.estimated_peak_gpu_memory)
+        backend == :gpu && (cfg[:usable_gpu_memory] = memory_plan.usable_gpu_memory)
+        backend == :gpu && (cfg[:memory_planner_fallback_used] = memory_plan.memory_planner_fallback_used)
         chunk_size = backend == :gpu ? min(memory_plan.particle_chunk_size, selected_particle_count) : chunk_size
         chunk_size > 0 || error("particle_chunk_size must be positive.")
         nchunks = cld(selected_particle_count, chunk_size)

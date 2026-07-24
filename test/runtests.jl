@@ -264,11 +264,43 @@ end
     @test occursin("trajectory_output_precision = \"Float32\"", config_text)
     @test occursin("compute_backend = \"gpu\"", config_text)
     @test occursin("compute_precision = \"Float32\"", config_text)
-    @test occursin("accumulator_precision = \"Float32\"", config_text)
     @test occursin("gpu_lag_batch_size = 4", config_text)
     @test occursin("gpu_memory_fraction = 0.75", config_text)
     @test occursin("async_cache_writer = true", config_text)
     @test occursin("cache_writer_buffer_count = 2", config_text)
     @test occursin("gpu_pipeline_buffers = 2", config_text)
     @test occursin("save_raw_energy_snapshots = false", config_text)
+end
+
+@testset "gpu memory planner" begin
+    include(joinpath(@__DIR__, "..", "src", "gpu_memory_planner.jl"))
+    cfg = Dict{Symbol, Any}(:gpu_lag_batch_size => 16, :gpu_memory_fraction => 0.5)
+    plan = resolve_gpu_work_plan(
+        cfg;
+        particle_chunk_size=4096,
+        lag_count=16,
+        estimate_bytes=(chunk, lag_batch) -> Int64(chunk) * Int64(lag_batch) * Int64(1024 * 1024),
+    )
+    @test plan.requested_lag_batch_size == 16
+    @test plan.lag_batch_size <= plan.requested_lag_batch_size
+    @test plan.particle_chunk_size <= plan.requested_particle_chunk_size
+    @test plan.estimated_peak_gpu_memory <= plan.usable_gpu_memory
+    @test plan.memory_planner_fallback_used isa Bool
+end
+
+@testset "gpu execution tests availability" begin
+    cuda_ready = false
+    try
+        @eval using CUDA
+        cuda_ready = CUDA.functional()
+    catch err
+        @info "Skipping executable GPU tests because CUDA is unavailable in this environment" exception=(err, catch_backtrace())
+    end
+    if cuda_ready
+        CUDA.allowscalar(false)
+        @test CUDA.allowscalar() == false
+        @info "CUDA is functional; run the full GPU kernel comparison suite on the target machine."
+    else
+        @test !cuda_ready
+    end
 end

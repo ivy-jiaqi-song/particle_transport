@@ -108,7 +108,6 @@ box_length_pc = 200.0
 field_subset = []
 compute_backend = "gpu"
 compute_precision = "Float32"
-accumulator_precision = "Float32"
 gpu_threads = 256
 gpu_lag_batch_size = 4
 gpu_memory_fraction = 0.75
@@ -160,7 +159,6 @@ use_usetex = false
 # the generated physical ensemble and trajectory parameters shared by both.
 compute_backend = "gpu"
 compute_precision = "Float32"
-accumulator_precision = "Float32"
 gpu_threads = 256
 gpu_lag_batch_size = 4
 gpu_memory_fraction = 0.75

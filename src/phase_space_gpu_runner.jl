@@ -525,10 +525,14 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     file["state_precision"] = string(cfg[:precision])
     file["packed_transfer_component_order"] = "x,y,z,px,py,pz"
     file["async_cache_writer_enabled"] = Bool(haskey(writer, :async) && writer.async)
+    file["direct_d2h_enabled"] = Bool(haskey(writer, :direct_d2h) && writer.direct_d2h)
+    file["async_d2h_enabled"] = Bool(haskey(writer, :async_d2h) && writer.async_d2h)
+    file["cache_transfer_stream_enabled"] = Bool(haskey(writer, :transfer_stream) && writer.transfer_stream)
+    file["cache_compute_stream_enabled"] = Bool(haskey(writer, :compute_stream) && writer.compute_stream)
     file["cache_writer_buffer_count"] = Int(haskey(writer, :buffer_count) ? writer.buffer_count : 1)
     file["cache_transfer_count_per_state"] = 1
     file["cache_transfer_layout"] = "packed_particle_component_matrix"
-    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_async_cache_writer_v1" : "sync_phase_space_writer_v1"
+    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_direct_d2h_hdf5_writer_v2" : "sync_phase_space_writer_v1"
     file["position_unit"] = "m"
     file["momentum_unit"] = "kg*m/s"
     write_injection_metadata!(file, cfg)

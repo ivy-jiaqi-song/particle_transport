@@ -81,6 +81,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :particle_block_size => 128,
         :dmumu_start_mode => :sliding,
         :lag_mode => :uniform_samples,
+        :lag_range_policy => :fixed,
+        :lag_boundary_policy => :strict,
+        :max_lag_boundary_relative_error => 0.0,
         :lag_min_gyroperiods => nothing,
         :lag_max_gyroperiods => nothing,
         :lag_stride_gyroperiods => nothing,
@@ -105,6 +108,9 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :particle_seed => 20260423,
         :particle_block_size => 128,
         :lag_mode => :uniform_samples,
+        :lag_range_policy => :fixed,
+        :lag_boundary_policy => :strict,
+        :max_lag_boundary_relative_error => 0.0,
         :lag_min_gyroperiods => nothing,
         :lag_max_gyroperiods => nothing,
         :lag_stride_gyroperiods => nothing,
@@ -628,6 +634,112 @@ function expected_time_resolution(cfg, fields, energy_GeV, time_reference)
     return trajectory_time, save_time, Float64(Omega0), Float64(time_reference.B0_reference_T)
 end
 
+function predicted_cache_axis_gyroperiods(trajectory_time, save_time)
+    save_indices = RunnerMod.sampled_step_indices(trajectory_time.n_integration_steps, save_time.trajectory_time_stride)
+    return [Float64(index - 1) * trajectory_time.dt_gyroperiods for index in save_indices]
+end
+
+function resolved_job_timing(cfg, fields, reference_fields, base_runner_cfg, energy_GeV)
+    time_reference = resolve_energy_time_reference(base_runner_cfg, reference_fields, energy_GeV, cfg[:reference_h5])
+    trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(base_runner_cfg, fields, energy_GeV, time_reference)
+    t_gyroperiods = predicted_cache_axis_gyroperiods(trajectory_time, save_time)
+    cache = RunnerMod.lag_cache_summary(t_gyroperiods)
+    return (
+        campaign_tag = String(cfg[:campaign_tag]),
+        trajectory_mode = String(cfg[:mode_name]),
+        energy_GeV = Float64(energy_GeV),
+        B0_reference_T = expected_B0,
+        Omega0_reference_s_inv = expected_Omega0,
+        reference_gyroperiod_s = time_reference.reference_gyroperiod_s,
+        timestep_limited_by = trajectory_time.timestep_limited_by,
+        dt_gyroperiods = trajectory_time.dt_gyroperiods,
+        save_stride_integration_steps = save_time.trajectory_time_stride,
+        requested_save_interval_gyroperiods = save_time.requested_trajectory_save_interval_gyroperiods,
+        actual_save_interval_gyroperiods = save_time.actual_trajectory_save_interval_gyroperiods,
+        integration_sample_count = trajectory_time.n_integration_steps,
+        cache_sample_count = length(t_gyroperiods),
+        cache_duration_gyroperiods = t_gyroperiods[end] - t_gyroperiods[1],
+        cache_lag_min_gyroperiods = cache.cache_min_gp,
+        cache_lag_max_gyroperiods = cache.cache_max_gp,
+        t_gyroperiods = t_gyroperiods,
+        trajectory_time = trajectory_time,
+        save_time = save_time,
+        time_reference = time_reference,
+    )
+end
+
+function lag_preflight_group_identity(cfg, analysis_label::AbstractString)
+    return join((cfg[:campaign_tag], cfg[:mode_name], cfg[:reference_h5], cache_mode_label(cfg[:cache_mode]), analysis_label), "|")
+end
+
+function apply_common_lag_range!(analysis_cfg, timing_plans, cfg, analysis_label::AbstractString)
+    if CombinedFullMod.normalize_lag_range_policy(get(analysis_cfg, :lag_range_policy, :fixed)) == :common_cache_intersection
+        common_min = maximum(plan.cache_lag_min_gyroperiods for plan in timing_plans)
+        common_max = minimum(plan.cache_lag_max_gyroperiods for plan in timing_plans)
+        common_max > common_min || error(analysis_label * " common-cache-intersection has no positive lag overlap for campaign " * string(cfg[:campaign_tag]))
+        analysis_cfg[:common_cache_lag_min_gyroperiods] = common_min
+        analysis_cfg[:common_cache_lag_max_gyroperiods] = common_max
+        analysis_cfg[:lag_comparison_group_identity] = lag_preflight_group_identity(cfg, analysis_label)
+    end
+    analysis_cfg[:analysis_label] = analysis_label
+    return analysis_cfg
+end
+
+function print_timing_preflight_report(cfg, timing_plans, dmumu_cfg, dpp_cfg)
+    println("Timing preflight:")
+    println("Energy [GeV]\tLimiter\tRequested cache dt/Tg0\tActual cache dt/Tg0\tCache lag range/Tg0")
+    for plan in timing_plans
+        println(join((
+            @sprintf("%.6g", plan.energy_GeV),
+            plan.timestep_limited_by,
+            @sprintf("%.12g", plan.requested_save_interval_gyroperiods),
+            @sprintf("%.12g", plan.actual_save_interval_gyroperiods),
+            "[" * @sprintf("%.12g", plan.cache_lag_min_gyroperiods) * ", " * @sprintf("%.12g", plan.cache_lag_max_gyroperiods) * "]",
+        ), '\t'))
+    end
+    for (label, analysis_cfg) in (("D_mumu", dmumu_cfg), ("D_pp", dpp_cfg))
+        analysis_cfg === nothing && continue
+        range_policy = CombinedFullMod.normalize_lag_range_policy(get(analysis_cfg, :lag_range_policy, :fixed))
+        common_min = get(analysis_cfg, :common_cache_lag_min_gyroperiods, NaN)
+        common_max = get(analysis_cfg, :common_cache_lag_max_gyroperiods, NaN)
+        first_grid = CombinedFullMod.resolve_lag_grid(analysis_cfg, first(timing_plans).t_gyroperiods)
+        println(label * " preflight:")
+        println("  configured range              = ", get(analysis_cfg, :lag_min_gyroperiods, nothing), " to ", get(analysis_cfg, :lag_max_gyroperiods, nothing), " reference gyroperiods")
+        if range_policy == :common_cache_intersection
+            println("  common representable range    = ", common_min, " to ", common_max, " reference gyroperiods")
+        end
+        println("  effective range               = ", first_grid.effective_lag_min_gyroperiods, " to ", first_grid.effective_lag_max_gyroperiods, " reference gyroperiods")
+        println("  boundary policy               = ", first_grid.lag_boundary_policy)
+        println("  expected requested lag count  = ", first_grid.requested_lag_count)
+    end
+    return nothing
+end
+
+function run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
+    timing_plans = [resolved_job_timing(cfg, fields, reference_fields, base_runner_cfg, energy_GeV) for energy_GeV in cfg[:energies]]
+    dmumu_cfg = cfg[:compute_dmumu] ? merge_cfg(CombinedFullMod.COMBINED_FULL_CFG, cfg[:dmumu_overrides]) : nothing
+    dpp_cfg = cfg[:compute_dpp] ? merge_cfg(DppFullMod.DPP_FULL_CFG, cfg[:dpp_overrides]) : nothing
+    dmumu_cfg !== nothing && apply_common_lag_range!(dmumu_cfg, timing_plans, cfg, "D_mumu")
+    dpp_cfg !== nothing && apply_common_lag_range!(dpp_cfg, timing_plans, cfg, "D_pp")
+    for plan in timing_plans
+        dmumu_cfg !== nothing && CombinedFullMod.resolve_lag_grid(dmumu_cfg, plan.t_gyroperiods)
+        dpp_cfg !== nothing && DppFullMod.resolve_lag_grid(dpp_cfg, plan.t_gyroperiods)
+    end
+    if dmumu_cfg !== nothing
+        for key in (:common_cache_lag_min_gyroperiods, :common_cache_lag_max_gyroperiods, :lag_comparison_group_identity, :analysis_label)
+            haskey(dmumu_cfg, key) && (cfg[:dmumu_overrides][key] = dmumu_cfg[key])
+        end
+    end
+    if dpp_cfg !== nothing
+        for key in (:common_cache_lag_min_gyroperiods, :common_cache_lag_max_gyroperiods, :lag_comparison_group_identity, :analysis_label)
+            haskey(dpp_cfg, key) && (cfg[:dpp_overrides][key] = dpp_cfg[key])
+        end
+    end
+    cfg[:timing_preflight_by_energy] = Dict(plan.energy_GeV => plan for plan in timing_plans)
+    print_timing_preflight_report(cfg, timing_plans, dmumu_cfg, dpp_cfg)
+    return timing_plans
+end
+
 function verify_cache_time_metadata(path_h5::AbstractString, cfg, fields, energy_GeV, time_reference)
     trajectory_time, save_time, expected_Omega0, expected_B0 = expected_time_resolution(cfg, fields, energy_GeV, time_reference)
     h5open(path_h5, "r") do file
@@ -786,6 +898,10 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_start_mode = CombinedFullMod.parse_dmumu_start_mode(h5_scalar_string_or(file, "dmumu_start_mode", "sliding"))
         stored_mu_bin_abs = h5_scalar_bool_or(file, "mu_bin_abs", false)
         stored_lag_mode = CombinedFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
+        stored_lag_range_policy = CombinedFullMod.normalize_lag_range_policy(h5_scalar_string_or(file, "lag_range_policy", "fixed"))
+        stored_lag_boundary_policy = CombinedFullMod.normalize_lag_boundary_policy(h5_scalar_string_or(file, "lag_boundary_policy", "strict"))
+        stored_boundary_rel_error = h5_scalar_float_or(file, "max_lag_boundary_relative_error", 0.0)
+        stored_group_identity = h5_scalar_string_or(file, "lag_comparison_group_identity", "not-applicable")
         stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
         stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
         stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
@@ -801,6 +917,10 @@ function combined_outputs_match_requested(path_h5::AbstractString, cfg)
         return stored_start_mode == CombinedFullMod.dmumu_start_mode(cfg) &&
                stored_mu_bin_abs == CombinedFullMod.mu_bin_abs(cfg) &&
                stored_lag_mode == cfg[:lag_mode] &&
+               stored_lag_range_policy == CombinedFullMod.normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed)) &&
+               stored_lag_boundary_policy == CombinedFullMod.normalize_lag_boundary_policy(get(cfg, :lag_boundary_policy, :strict)) &&
+               isapprox(stored_boundary_rel_error, Float64(get(cfg, :max_lag_boundary_relative_error, 0.0)); atol=0.0, rtol=0.0) &&
+               stored_group_identity == String(get(cfg, :lag_comparison_group_identity, "not-applicable")) &&
                stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
                stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
@@ -822,6 +942,10 @@ function dpp_outputs_match_requested(path_h5::AbstractString, cfg)
         haskey(file, "source_cache_analysis_sample_count") || return false
         haskey(file, "source_cache_save_interval_gyroperiods") || return false
         stored_lag_mode = DppFullMod.parse_lag_mode(h5_scalar_string_or(file, "lag_mode", "uniform_samples"))
+        stored_lag_range_policy = DppFullMod.normalize_lag_range_policy(h5_scalar_string_or(file, "lag_range_policy", "fixed"))
+        stored_lag_boundary_policy = DppFullMod.normalize_lag_boundary_policy(h5_scalar_string_or(file, "lag_boundary_policy", "strict"))
+        stored_boundary_rel_error = h5_scalar_float_or(file, "max_lag_boundary_relative_error", 0.0)
+        stored_group_identity = h5_scalar_string_or(file, "lag_comparison_group_identity", "not-applicable")
         stored_lag_sample_count = h5_scalar_int_or(file, "n_lag_samples", Int(cfg[:n_lag_samples]))
         stored_requested_n_lag_samples = h5_scalar_int_or(file, "requested_n_lag_samples", stored_lag_sample_count)
         stored_min_lag_steps = h5_scalar_int_or(file, "min_lag_steps", 1)
@@ -832,6 +956,10 @@ function dpp_outputs_match_requested(path_h5::AbstractString, cfg)
         stored_lag_stride_gp = h5_scalar_float_or(file, "lag_stride_gyroperiods", nothing)
         requested_max_lag_steps = cfg[:max_lag_steps] === nothing ? -1 : Int(cfg[:max_lag_steps])
         return stored_lag_mode == cfg[:lag_mode] &&
+               stored_lag_range_policy == DppFullMod.normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed)) &&
+               stored_lag_boundary_policy == DppFullMod.normalize_lag_boundary_policy(get(cfg, :lag_boundary_policy, :strict)) &&
+               isapprox(stored_boundary_rel_error, Float64(get(cfg, :max_lag_boundary_relative_error, 0.0)); atol=0.0, rtol=0.0) &&
+               stored_group_identity == String(get(cfg, :lag_comparison_group_identity, "not-applicable")) &&
                stored_requested_n_lag_samples == Int(cfg[:n_lag_samples]) &&
                stored_min_lag_steps == Int(get(cfg, :min_lag_steps, 1)) &&
                stored_lag_step_stride == Int(cfg[:lag_step_stride]) &&
@@ -1768,6 +1896,7 @@ function run_campaign(cfg)
     reference_runner_cfg = merge_cfg(base_runner_cfg, Dict{Symbol, Any}(:file => cfg[:reference_h5]))
     println("Loading total-field reference once for time normalization")
     reference_fields = RunnerMod.load_static_fields(reference_runner_cfg, reference_runner_cfg[:precision])
+    run_timing_preflight!(cfg, fields, reference_fields, base_runner_cfg)
 
     summary_rows = Any[]
     summary_path = joinpath(cfg[:campaign_root], "campaign_summary.tsv")
@@ -2052,11 +2181,13 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
     key in (:boundary, :compute_backend, :particle_selection, :injection_mode, :injection_position_mode, :injection_position_unit) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
+    key == :lag_range_policy && return CombinedFullMod.normalize_lag_range_policy(value)
+    key == :lag_boundary_policy && return CombinedFullMod.normalize_lag_boundary_policy(value)
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
     key == :mu_bin_abs && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
-    key in (:trajectory_duration_gyroperiods, :trajectory_save_interval_gyroperiods, :integration_steps_per_gyroperiod, :lag_min_gyroperiods, :lag_max_gyroperiods, :lag_stride_gyroperiods) && return config_float(value, key_name)
+    key in (:trajectory_duration_gyroperiods, :trajectory_save_interval_gyroperiods, :integration_steps_per_gyroperiod, :lag_min_gyroperiods, :lag_max_gyroperiods, :lag_stride_gyroperiods, :max_lag_boundary_relative_error) && return config_float(value, key_name)
     key == :use_usetex && return config_bool(value, key_name)
     return value
 end
@@ -2452,6 +2583,12 @@ function runtime_config()
             record_time_keys!(cfg, :dmumu_lag_min, :cli, ["min_lag_steps"])
         elseif startswith(argument, "--dmumu-lag-mode=")
             cfg[:dmumu_overrides][:lag_mode] = CombinedFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-lag-range-policy=")
+            cfg[:dmumu_overrides][:lag_range_policy] = CombinedFullMod.normalize_lag_range_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-lag-boundary-policy=")
+            cfg[:dmumu_overrides][:lag_boundary_policy] = CombinedFullMod.normalize_lag_boundary_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dmumu-max-lag-boundary-relative-error=")
+            cfg[:dmumu_overrides][:max_lag_boundary_relative_error] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-n-lag-samples=")
             cfg[:dmumu_overrides][:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dmumu-lag-step-stride=")
@@ -2498,6 +2635,12 @@ function runtime_config()
             record_time_keys!(cfg, :dpp_lag_min, :cli, ["min_lag_steps"])
         elseif startswith(argument, "--dpp-lag-mode=")
             cfg[:dpp_overrides][:lag_mode] = DppFullMod.parse_lag_mode(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-lag-range-policy=")
+            cfg[:dpp_overrides][:lag_range_policy] = DppFullMod.normalize_lag_range_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-lag-boundary-policy=")
+            cfg[:dpp_overrides][:lag_boundary_policy] = DppFullMod.normalize_lag_boundary_policy(split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-max-lag-boundary-relative-error=")
+            cfg[:dpp_overrides][:max_lag_boundary_relative_error] = parse(Float64, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-n-lag-samples=")
             cfg[:dpp_overrides][:n_lag_samples] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-lag-step-stride=")

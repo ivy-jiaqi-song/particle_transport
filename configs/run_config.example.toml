@@ -128,6 +128,9 @@ particle_block_size = 128
 # If lag_max_gyroperiods is omitted, the full cached duration is used.
 # stride: use lag_min_gyroperiods, lag_min_gyroperiods + lag_stride_gyroperiods, ...
 lag_mode = "uniform-samples"
+lag_range_policy = "common-cache-intersection"  # "fixed", "first-cache-step", or "common-cache-intersection".
+lag_boundary_policy = "nearest"  # "strict" preserves exact range rejection; "nearest" allows bounded cache-step snapping.
+max_lag_boundary_relative_error = 0.05
 lag_min_gyroperiods = 0.015915494309189534
 n_lag_samples = 40
 lag_max_gyroperiods = 795.7747154594767
@@ -155,6 +158,9 @@ particle_selection = "block-random"
 particle_seed = 20260423
 particle_block_size = 128
 lag_mode = "uniform-samples"
+lag_range_policy = "common-cache-intersection"
+lag_boundary_policy = "nearest"
+max_lag_boundary_relative_error = 0.05
 lag_min_gyroperiods = 0.015915494309189534
 n_lag_samples = 40
 lag_max_gyroperiods = 795.7747154594767

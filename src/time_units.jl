@@ -209,6 +209,105 @@ function uniform_prefix_length(t_gyroperiods; rtol::Real=1.0e-10, atol::Real=1.0
     return prefix
 end
 
+function normalize_lag_boundary_policy(value)
+    policy = Symbol(replace(lowercase(strip(String(value))), "-" => "_"))
+    policy in (:strict, :nearest) || error("lag_boundary_policy must be strict or nearest.")
+    return policy
+end
+
+function normalize_lag_range_policy(value)
+    policy = Symbol(replace(lowercase(strip(String(value))), "-" => "_"))
+    policy in (:fixed, :first_cache_step, :common_cache_intersection) || error("lag_range_policy must be fixed, first-cache-step, or common-cache-intersection.")
+    return policy
+end
+
+function lag_cache_summary(t_gyroperiods)
+    nsteps = length(t_gyroperiods)
+    nsteps > 1 || error("Need at least two cached samples to resolve lags.")
+    offsets = Float64.(t_gyroperiods[2:end]) .- Float64(t_gyroperiods[1])
+    cache_min_gp = first(offsets)
+    cache_max_gp = last(offsets)
+    cache_save_interval_gp = length(offsets) == 1 ? cache_min_gp : first(diff(Float64.(t_gyroperiods)))
+    tolerance = 1.0e-12 + 1.0e-10 * max(abs(cache_save_interval_gp), abs(cache_max_gp), 1.0)
+    return (offsets=offsets, cache_min_gp=cache_min_gp, cache_max_gp=cache_max_gp, cache_save_interval_gp=cache_save_interval_gp, tolerance=tolerance)
+end
+
+function nearest_positive_cache_lag(requested_gp::Real, cache)
+    requested = Float64(requested_gp)
+    isfinite(requested) && requested > 0.0 || error("Lag boundary values must be finite and positive reference gyroperiods.")
+    nearest_local = argmin(abs.(cache.offsets .- requested))
+    nearest_step = Int(nearest_local)
+    nearest_step >= 1 || error("Lag boundary cannot resolve to zero lag.")
+    return nearest_step, Float64(cache.offsets[nearest_local]), abs(Float64(cache.offsets[nearest_local]) - requested)
+end
+
+function resolve_one_lag_boundary(requested_gp::Real, cache, cfg, boundary_name::AbstractString; analysis_label::AbstractString="lag")
+    policy = normalize_lag_boundary_policy(get(cfg, :lag_boundary_policy, :strict))
+    requested = Float64(requested_gp)
+    nearest_step, actual, abs_error = nearest_positive_cache_lag(requested, cache)
+    if policy == :strict
+        if boundary_name == "minimum"
+            requested >= cache.cache_min_gp - cache.tolerance || error("Requested lag range minimum $(requested) reference gyroperiods is outside representable cache range [$(cache.cache_min_gp), $(cache.cache_max_gp)] reference gyroperiods. Use lag_boundary_policy = \"nearest\" with an explicit tolerance for discretization-scale cache-cadence mismatches, use lag_range_policy = \"first-cache-step\", or adjust lag_min_gyroperiods.")
+        else
+            requested <= cache.cache_max_gp + cache.tolerance || error("Requested lag range maximum $(requested) reference gyroperiods is outside representable cache range [$(cache.cache_min_gp), $(cache.cache_max_gp)] reference gyroperiods. Use lag_boundary_policy = \"nearest\" with an explicit tolerance for discretization-scale cache-cadence mismatches or adjust lag_max_gyroperiods/trajectory_duration_gyroperiods.")
+        end
+        return requested
+    end
+
+    max_relative_error = Float64(get(cfg, :max_lag_boundary_relative_error, 0.0))
+    isfinite(max_relative_error) && max_relative_error >= 0.0 || error("max_lag_boundary_relative_error must be finite and nonnegative.")
+    abs_error <= 0.5 * cache.cache_save_interval_gp + cache.tolerance || error("Requested lag boundary $(requested) reference gyroperiods is too far from the nearest cached lag $(actual) reference gyroperiods for nearest policy. Absolute error $(abs_error) exceeds half the cache interval $(0.5 * cache.cache_save_interval_gp).")
+    rel_error = abs_error / max(abs(requested), eps(Float64))
+    rel_error <= max_relative_error + cache.tolerance || error("Requested lag boundary $(requested) reference gyroperiods maps to $(actual) reference gyroperiods with relative error $(rel_error), exceeding max_lag_boundary_relative_error=$(max_relative_error).")
+    if abs_error > cache.tolerance
+        @warn string(analysis_label, " lag boundary adjusted by nearest policy") boundary=boundary_name requested_gyroperiods=requested resolved_gyroperiods=actual absolute_error_gyroperiods=abs_error relative_error=rel_error cache_interval_gyroperiods=cache.cache_save_interval_gp configured_tolerance=max_relative_error
+    end
+    return actual
+end
+
+function configured_lag_bounds(cfg, cache)
+    configured_min = get(cfg, :lag_min_gyroperiods, nothing)
+    configured_max = get(cfg, :lag_max_gyroperiods, nothing)
+    range_policy = normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed))
+
+    if range_policy == :first_cache_step
+        configured_min === nothing || error("lag_range_policy = first-cache-step requires lag_min_gyroperiods to be absent or nothing.")
+        lag_min = cache.cache_min_gp
+        lag_max = configured_max === nothing ? cache.cache_max_gp : assert_finite_positive(configured_max, "lag_max_gyroperiods")
+        return configured_min, configured_max, lag_min, lag_max, NaN, NaN
+    end
+
+    lag_min = configured_min === nothing ? cache.cache_min_gp : assert_finite_positive(configured_min, "lag_min_gyroperiods")
+    lag_max = configured_max === nothing ? cache.cache_max_gp : assert_finite_positive(configured_max, "lag_max_gyroperiods")
+    if range_policy == :common_cache_intersection
+        common_min = Float64(get(cfg, :common_cache_lag_min_gyroperiods, NaN))
+        common_max = Float64(get(cfg, :common_cache_lag_max_gyroperiods, NaN))
+        isfinite(common_min) && isfinite(common_max) || error("lag_range_policy = common-cache-intersection requires a preflight common cache range.")
+        common_max > common_min || error("Common cache lag intersection is empty.")
+        lag_min = max(lag_min, common_min)
+        lag_max = min(lag_max, common_max)
+        lag_max > lag_min || error("Effective lag range is empty after applying common-cache-intersection.")
+        return configured_min, configured_max, lag_min, lag_max, common_min, common_max
+    end
+    return configured_min, configured_max, lag_min, lag_max, NaN, NaN
+end
+
+function build_requested_lags_from_bounds(cfg, lag_min::Real, lag_max::Real)
+    mode = cfg[:lag_mode]
+    lag_min_f = Float64(lag_min)
+    lag_max_f = Float64(lag_max)
+    lag_max_f >= lag_min_f || error("lag_max_gyroperiods must be >= lag_min_gyroperiods after policy resolution.")
+    if mode == :uniform_samples
+        n_lag_samples = Int(cfg[:n_lag_samples])
+        n_lag_samples > 0 || error("n_lag_samples must be positive.")
+        return collect(range(lag_min_f, lag_max_f, length=n_lag_samples)), :gyroperiods
+    elseif mode == :stride
+        lag_stride = assert_finite_positive(cfg[:lag_stride_gyroperiods], "lag_stride_gyroperiods")
+        return collect(lag_min_f:lag_stride:(lag_max_f + lag_stride * 1.0e-12)), :gyroperiods
+    end
+    error("Unknown lag_mode: $(mode)")
+end
+
 function requested_lag_grid_gyroperiods(cfg, max_cache_lag_step::Integer, t_gyroperiods)
     mode = cfg[:lag_mode]
     if haskey(cfg, :lag_min_gyroperiods) && cfg[:lag_min_gyroperiods] !== nothing
@@ -248,17 +347,44 @@ function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=2)
     nsteps = length(t_gyroperiods)
     nsteps > 1 || error("Need at least two cached samples to resolve lags.")
     max_cache_lag_step = nsteps - 1
-    requested_tau_gp, source = requested_lag_grid_gyroperiods(cfg, max_cache_lag_step, t_gyroperiods)
+    cache = lag_cache_summary(t_gyroperiods)
+    range_policy = normalize_lag_range_policy(get(cfg, :lag_range_policy, :fixed))
+    boundary_policy = normalize_lag_boundary_policy(get(cfg, :lag_boundary_policy, :strict))
+    boundary_relative_error = Float64(get(cfg, :max_lag_boundary_relative_error, 0.0))
+    isfinite(boundary_relative_error) && boundary_relative_error >= 0.0 || error("max_lag_boundary_relative_error must be finite and nonnegative.")
+    analysis_label = String(get(cfg, :analysis_label, "transport"))
+
+    configured_min_gp = get(cfg, :lag_min_gyroperiods, nothing)
+    configured_max_gp = get(cfg, :lag_max_gyroperiods, nothing)
+    common_min_gp = NaN
+    common_max_gp = NaN
+    effective_min_gp = NaN
+    effective_max_gp = NaN
+
+    requested_tau_gp, source = if range_policy == :fixed && configured_min_gp === nothing
+        requested_lag_grid_gyroperiods(cfg, max_cache_lag_step, t_gyroperiods)
+    else
+        configured_min_gp, configured_max_gp, requested_min_gp, requested_max_gp, common_min_gp, common_max_gp = configured_lag_bounds(cfg, cache)
+        if range_policy == :common_cache_intersection
+            effective_min_gp = requested_min_gp
+            effective_max_gp = requested_max_gp
+        else
+            effective_min_gp = resolve_one_lag_boundary(requested_min_gp, cache, cfg, "minimum"; analysis_label=analysis_label)
+            effective_max_gp = resolve_one_lag_boundary(requested_max_gp, cache, cfg, "maximum"; analysis_label=analysis_label)
+        end
+        effective_max_gp > effective_min_gp || error("Effective lag range resolves to zero width after applying lag boundary policy.")
+        build_requested_lags_from_bounds(cfg, effective_min_gp, effective_max_gp)
+    end
     isempty(requested_tau_gp) && error("No requested lag values were generated.")
 
-    offsets = Float64.(t_gyroperiods[2:end]) .- Float64(t_gyroperiods[1])
-    cache_min_gp = first(offsets)
-    cache_max_gp = last(offsets)
-    cache_save_interval_gp = length(offsets) == 1 ? cache_min_gp : first(diff(Float64.(t_gyroperiods)))
+    offsets = cache.offsets
+    cache_min_gp = cache.cache_min_gp
+    cache_max_gp = cache.cache_max_gp
+    cache_save_interval_gp = cache.cache_save_interval_gp
     requested_min_gp = minimum(Float64.(requested_tau_gp))
     requested_max_gp = maximum(Float64.(requested_tau_gp))
-    tolerance = 1.0e-12 + 1.0e-10 * max(abs(cache_save_interval_gp), abs(cache_max_gp), 1.0)
-    if requested_min_gp < cache_min_gp - tolerance || requested_max_gp > cache_max_gp + tolerance
+    tolerance = cache.tolerance
+    if boundary_policy == :strict && (requested_min_gp < cache_min_gp - tolerance || requested_max_gp > cache_max_gp + tolerance)
         error("Requested lag range [$(requested_min_gp), $(requested_max_gp)] reference gyroperiods is outside representable cache range [$(cache_min_gp), $(cache_max_gp)] reference gyroperiods. Cache save interval is $(cache_save_interval_gp) reference gyroperiods and cache duration is $(cache_max_gp) reference gyroperiods. Adjust lag_min_gyroperiods/lag_max_gyroperiods or regenerate the cache with a different trajectory_save_interval_gyroperiods or trajectory_duration_gyroperiods.")
     end
 
@@ -301,9 +427,20 @@ function resolve_lag_grid(cfg, t_gyroperiods; min_unique_lags::Integer=2)
         requested_lag_count = length(requested_tau_gp),
         unique_lag_count = length(lag_steps),
         duplicate_lag_mapping_count = length(requested_tau_gp) - length(lag_steps),
+        duplicate_lag_mapping_fraction = isempty(requested_tau_gp) ? 0.0 : (length(requested_tau_gp) - length(lag_steps)) / length(requested_tau_gp),
         cache_lag_min_gyroperiods = cache_min_gp,
         cache_lag_max_gyroperiods = cache_max_gp,
         cache_save_interval_gyroperiods = cache_save_interval_gp,
+        lag_range_policy = range_policy,
+        lag_boundary_policy = boundary_policy,
+        max_lag_boundary_relative_error = boundary_relative_error,
+        configured_lag_min_gyroperiods = configured_min_gp === nothing ? NaN : Float64(configured_min_gp),
+        configured_lag_max_gyroperiods = configured_max_gp === nothing ? NaN : Float64(configured_max_gp),
+        common_cache_lag_min_gyroperiods = common_min_gp,
+        common_cache_lag_max_gyroperiods = common_max_gp,
+        effective_lag_min_gyroperiods = isfinite(effective_min_gp) ? effective_min_gp : requested_min_gp,
+        effective_lag_max_gyroperiods = isfinite(effective_max_gp) ? effective_max_gp : requested_max_gp,
+        lag_comparison_group_identity = String(get(cfg, :lag_comparison_group_identity, "not-applicable")),
         lag_source = source,
     )
 end

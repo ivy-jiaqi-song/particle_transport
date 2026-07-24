@@ -64,6 +64,9 @@ end
     t_gp = collect(0.0:0.25:5.0)
     cfg = Dict{Symbol, Any}(
         :lag_mode => :uniform_samples,
+        :lag_range_policy => :fixed,
+        :lag_boundary_policy => :strict,
+        :max_lag_boundary_relative_error => 0.0,
         :lag_min_gyroperiods => 0.25,
         :lag_max_gyroperiods => 1.1,
         :lag_stride_gyroperiods => nothing,
@@ -106,6 +109,98 @@ end
     @test duplicate_grid.requested_lag_count == 4
     @test duplicate_grid.unique_lag_count < duplicate_grid.requested_lag_count
     @test duplicate_grid.duplicate_lag_mapping_count > 0
+    @test duplicate_grid.duplicate_lag_mapping_fraction > 0.0
+end
+
+@testset "lag boundary policies" begin
+    t_gp = collect(0.0:0.016087419809019843:5.984520168955382)
+    cfg = Dict{Symbol, Any}(
+        :lag_mode => :uniform_samples,
+        :lag_range_policy => :fixed,
+        :lag_boundary_policy => :strict,
+        :max_lag_boundary_relative_error => 0.05,
+        :lag_min_gyroperiods => 0.015625,
+        :lag_max_gyroperiods => 5.0,
+        :lag_stride_gyroperiods => nothing,
+        :min_lag_steps => 1,
+        :max_lag_steps => nothing,
+        :lag_step_stride => 1,
+        :n_lag_samples => 40,
+    )
+    @test_throws ErrorException resolve_lag_grid(cfg, t_gp)
+
+    nearest_cfg = copy(cfg)
+    nearest_cfg[:lag_boundary_policy] = :nearest
+    lag_grid = resolve_lag_grid(nearest_cfg, t_gp)
+    @test first(lag_grid.tau_gyroperiods) ≈ 0.016087419809019843
+    @test first(lag_grid.requested_tau_gyroperiods) ≈ 0.016087419809019843
+    @test lag_grid.effective_lag_min_gyroperiods ≈ 0.016087419809019843
+    @test lag_grid.lag_boundary_policy == :nearest
+
+    too_tight = copy(nearest_cfg)
+    too_tight[:max_lag_boundary_relative_error] = 0.01
+    @test_throws ErrorException resolve_lag_grid(too_tight, t_gp)
+
+    far_below = copy(nearest_cfg)
+    far_below[:lag_min_gyroperiods] = 0.001
+    @test_throws ErrorException resolve_lag_grid(far_below, t_gp)
+
+    max_nearest = copy(nearest_cfg)
+    max_nearest[:lag_min_gyroperiods] = 0.016087419809019843
+    max_nearest[:lag_max_gyroperiods] = last(t_gp) + 0.25 * 0.016087419809019843
+    max_grid = resolve_lag_grid(max_nearest, t_gp)
+    @test last(max_grid.tau_gyroperiods) ≈ last(t_gp)
+
+    max_far = copy(max_nearest)
+    max_far[:lag_max_gyroperiods] = last(t_gp) + 2.0 * 0.016087419809019843
+    @test_throws ErrorException resolve_lag_grid(max_far, t_gp)
+end
+
+@testset "lag range policies" begin
+    t_gp_a = collect(0.0:0.25:5.0)
+    t_gp_b = collect(0.0:0.30:4.8)
+    cfg = Dict{Symbol, Any}(
+        :lag_mode => :uniform_samples,
+        :lag_range_policy => :first_cache_step,
+        :lag_boundary_policy => :strict,
+        :max_lag_boundary_relative_error => 0.0,
+        :lag_min_gyroperiods => nothing,
+        :lag_max_gyroperiods => 1.0,
+        :lag_stride_gyroperiods => nothing,
+        :min_lag_steps => 1,
+        :max_lag_steps => nothing,
+        :lag_step_stride => 1,
+        :n_lag_samples => 4,
+    )
+    first_grid = resolve_lag_grid(cfg, t_gp_b)
+    @test first_grid.effective_lag_min_gyroperiods ≈ 0.30
+
+    bad_first = copy(cfg)
+    bad_first[:lag_min_gyroperiods] = 0.25
+    @test_throws ErrorException resolve_lag_grid(bad_first, t_gp_b)
+
+    common_cfg = copy(cfg)
+    common_cfg[:lag_range_policy] = :common_cache_intersection
+    common_cfg[:lag_min_gyroperiods] = 0.25
+    common_cfg[:lag_max_gyroperiods] = 5.0
+    common_cfg[:common_cache_lag_min_gyroperiods] = max(lag_cache_summary(t_gp_a).cache_min_gp, lag_cache_summary(t_gp_b).cache_min_gp)
+    common_cfg[:common_cache_lag_max_gyroperiods] = min(lag_cache_summary(t_gp_a).cache_max_gp, lag_cache_summary(t_gp_b).cache_max_gp)
+    common_cfg[:lag_comparison_group_identity] = "test-group"
+    common_grid = resolve_lag_grid(common_cfg, t_gp_a)
+    @test common_grid.effective_lag_min_gyroperiods ≈ 0.30
+    @test common_grid.effective_lag_max_gyroperiods ≈ 4.8
+    @test common_grid.lag_comparison_group_identity == "test-group"
+
+    no_overlap = copy(common_cfg)
+    no_overlap[:common_cache_lag_min_gyroperiods] = 5.0
+    no_overlap[:common_cache_lag_max_gyroperiods] = 4.0
+    @test_throws ErrorException resolve_lag_grid(no_overlap, t_gp_a)
+
+    collapsed = copy(common_cfg)
+    collapsed[:n_lag_samples] = 20
+    collapsed[:lag_min_gyroperiods] = 0.31
+    collapsed[:lag_max_gyroperiods] = 0.37
+    @test_throws ErrorException resolve_lag_grid(collapsed, t_gp_a)
 end
 
 @testset "time axes" begin

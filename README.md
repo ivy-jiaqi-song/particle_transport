@@ -150,8 +150,9 @@ generation.
 Primary cached analysis arrays are uniformly sampled. If the exact integration
 end does not fall on the requested cache cadence, that off-cadence final sample
 is not appended to `/positions`, `/momenta`, `/mu`, or the time axes used by
-transport estimators. Requested physical lags outside the representable cached
-range are rejected rather than clamped to a boundary.
+transport estimators. Requested physical lags are resolved against the positive
+cached-step lag range before transport analysis starts; the loops still use
+integer cached-step offsets.
 
 ## Legacy Cache Compatibility
 
@@ -211,6 +212,49 @@ Step-stride lag and cache-cadence mappings depend on the resolved integration
 and saved-cache cadence, so the code reports requested and actual values rather
 than requiring users to calculate them manually. Mixing old and new keys for the
 same quantity is rejected.
+
+The actual integration timestep is the smaller of the requested gyroperiod
+timestep and the CFL cell-crossing limiter when CFL is enabled:
+
+```text
+dt_actual = min(dt_gyro, dt_CFL)
+dt_save_actual = round(dt_save_requested / dt_actual) * dt_actual
+```
+
+Because the save cadence is an integer number of actual integration steps, the
+same requested cache interval can resolve slightly differently across particle
+energies. This matters for physical lag requests near the first cached step or
+near the cache duration.
+
+Lag range controls in `[dmumu]` and `[dpp]`:
+
+| Control | Values |
+| --- | --- |
+| `lag_range_policy` | `fixed`, `first-cache-step`, `common-cache-intersection` |
+| `lag_boundary_policy` | `strict`, `nearest` |
+| `max_lag_boundary_relative_error` | nonnegative relative tolerance for `nearest` |
+
+`fixed` uses the configured `lag_min_gyroperiods` and `lag_max_gyroperiods`.
+`first-cache-step` starts each job at its first positive cached lag and rejects a
+numeric `lag_min_gyroperiods`. `common-cache-intersection` intersects the
+representable cache ranges across the selected energies in the current campaign
+and maps one common nominal requested grid onto each job's actual cache axis.
+
+`strict` preserves the historical behavior: configured boundaries must already
+lie inside the representable cache range. `nearest` can adjust a boundary to the
+nearest positive cached lag only when the absolute error is no more than half of
+the actual cache interval and the relative error is within
+`max_lag_boundary_relative_error`; this is bounded cache-grid snapping, not
+arbitrary clamping. Interior requested lags keep the same half-cache-interval
+mapping bound, duplicate mapped offsets are removed deterministically, and the
+HDF5 output records requested lags, actual lags, mapping errors, policy names,
+effective boundaries, duplicate counts, and the comparison group identity.
+
+Before any trajectory cache is generated or reused, each campaign prints a timing
+preflight table for all selected energies showing the active timestep limiter,
+requested and actual cache interval, and representable lag range. If a requested
+`D_mumu` or `D_pp` lag policy cannot produce a valid grid, the run fails at this
+preflight stage.
 
 ## Campaign Examples
 

@@ -4,6 +4,7 @@ using Random
 using Statistics
 
 include(joinpath(@__DIR__, "time_units.jl"))
+include(joinpath(@__DIR__, "gpu_async_cache_writer.jl"))
 
 const C_LIGHT = 2.99792458e8
 const Q_E = 1.602176634e-19
@@ -44,6 +45,8 @@ const CFG = Dict{Symbol, Any}(
     :trajectory_time_stride => 1,
     :trajectory_save_interval_gyroperiods => nothing,
     :trajectory_output_precision => Float32,
+    :async_cache_writer => true,
+    :cache_writer_buffer_count => 2,
     :progress_every => 5000,
     :output_dir => DEFAULT_OUTPUT_DIR,
 )
@@ -500,6 +503,7 @@ function write_phase_space_packed_step!(writer, save_idx::Integer, packed)
 end
 
 function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, time_reference)
+    (haskey(writer, :async) && writer.async) && finish_async_phase_space_writer!(writer)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
@@ -520,8 +524,11 @@ function finalize_phase_space_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_
     file["trajectory_output_precision"] = string(writer.outtype)
     file["state_precision"] = string(cfg[:precision])
     file["packed_transfer_component_order"] = "x,y,z,px,py,pz"
-    file["async_cache_writer_enabled"] = false
-    file["cache_writer_buffer_count"] = 1
+    file["async_cache_writer_enabled"] = Bool(haskey(writer, :async) && writer.async)
+    file["cache_writer_buffer_count"] = Int(haskey(writer, :buffer_count) ? writer.buffer_count : 1)
+    file["cache_transfer_count_per_state"] = 1
+    file["cache_transfer_layout"] = "packed_particle_component_matrix"
+    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_async_cache_writer_v1" : "sync_phase_space_writer_v1"
     file["position_unit"] = "m"
     file["momentum_unit"] = "kg*m/s"
     write_injection_metadata!(file, cfg)
@@ -635,7 +642,9 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference)
     elapsed = NaN
     writer = nothing
     try
-        writer = create_phase_space_writer(output_paths(cfg, energy_GeV).h5, cfg[:n_particles], nsave, trajectory_out_type)
+        writer = Bool(get(cfg, :async_cache_writer, true)) ?
+            create_async_phase_space_writer(output_paths(cfg, energy_GeV).h5, cfg[:n_particles], nsave, trajectory_out_type, Int(get(cfg, :cache_writer_buffer_count, 2))) :
+            create_phase_space_writer(output_paths(cfg, energy_GeV).h5, cfg[:n_particles], nsave, trajectory_out_type)
 
         elapsed = @elapsed begin
             next_save_ptr = 1
@@ -645,9 +654,15 @@ function run_gpu_ensemble(cfg, fields; energy_GeV, time_reference)
                 end
 
                 if next_save_ptr <= nsave && si == save_indices[next_save_ptr]
-                    @cuda threads=threads blocks=blocks pack_phase_space_kernel!(dpacked_step, dx1, dx2, dx3, dp1, dp2, dp3, dalive)
                     alive_fraction[si] = Float64(Array(dalive_count)[1]) / Float64(cfg[:n_particles])
-                    write_phase_space_packed_step!(writer, next_save_ptr, Array(dpacked_step))
+                    if haskey(writer, :async) && writer.async
+                        enqueue_phase_space_step!(writer, next_save_ptr, alive_fraction[si]) do slot_buffer
+                            @cuda threads=threads blocks=blocks pack_phase_space_kernel!(slot_buffer, dx1, dx2, dx3, dp1, dp2, dp3, dalive)
+                        end
+                    else
+                        @cuda threads=threads blocks=blocks pack_phase_space_kernel!(dpacked_step, dx1, dx2, dx3, dp1, dp2, dp3, dalive)
+                        write_phase_space_packed_step!(writer, next_save_ptr, Array(dpacked_step))
+                    end
                     next_save_ptr += 1
                 end
 

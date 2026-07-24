@@ -20,6 +20,8 @@ using Printf
 using Statistics
 using TOML
 
+include(joinpath(@__DIR__, "gpu_async_cache_writer.jl"))
+
 const MODE_DECOMPOSITION_ROOT = raw"/home/user0001/MHDFlows_replicate/multiphase_mode_decomposition/outputs"
 const TURBULENCE_TAGS = ("0_5", "0_9", "1_0")
 const MODE_NAMES = ("alfven", "fast", "slow")
@@ -64,6 +66,8 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :trajectory_time_stride => 1,
         :trajectory_save_interval_gyroperiods => nothing,
         :trajectory_output_precision => Float32,
+        :async_cache_writer => true,
+        :cache_writer_buffer_count => 2,
         :progress_every => 5000,
     ),
     :dmumu_overrides => Dict{Symbol, Any}(
@@ -72,7 +76,11 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :field_subset => nothing,
         :compute_backend => :gpu,
         :compute_precision => Float32,
+        :accumulator_precision => Float32,
         :gpu_threads => 256,
+        :gpu_lag_batch_size => 4,
+        :gpu_memory_fraction => 0.75,
+        :gpu_pipeline_buffers => 2,
         :particle_chunk_size => 128,
         :first_particle => 1,
         :n_particles_to_use => 10000,
@@ -104,9 +112,11 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
     :dpp_overrides => Dict{Symbol, Any}(
         :compute_backend => :gpu,
         :compute_precision => Float32,
+        :accumulator_precision => Float32,
         :gpu_threads => 256,
         :gpu_lag_batch_size => 4,
         :gpu_memory_fraction => 0.75,
+        :gpu_pipeline_buffers => 2,
         :particle_chunk_size => 128,
         :first_particle => 1,
         :n_particles_to_use => 10000,
@@ -126,6 +136,8 @@ const CACHE_PIPELINE_CFG = Dict{Symbol, Any}(
         :max_lag_steps => nothing,
         :lag_step_stride => 1,
         :n_energy_snapshots => 5,
+        :n_energy_bins => 64,
+        :save_raw_energy_snapshots => false,
         :use_usetex => false,
     ),
 )
@@ -1033,11 +1045,17 @@ function verify_dpp_outputs(path_h5::AbstractString, path_png::AbstractString)
         energy_group = file["energy_snapshots"]
         dpp_tau_norm = read(dpp_group["tau_norm"])
         dpp_centered = read(dpp_group["D_pp_centered_norm"])
-        energies = read(energy_group["energy_GeV"])
         length(dpp_tau_norm) == length(dpp_centered) || error("D_pp verification failed: tau/curve mismatch for " * path_h5)
         any(isfinite, dpp_centered) || error("D_pp verification failed: no finite D_pp values in " * path_h5)
-        size(energies, 1) > 0 || error("D_pp verification failed: no energy snapshots in " * path_h5)
-        any(isfinite, energies) || error("D_pp verification failed: no finite snapshot energies in " * path_h5)
+        if haskey(energy_group, "energy_GeV")
+            energies = read(energy_group["energy_GeV"])
+            size(energies, 1) > 0 || error("D_pp verification failed: no energy snapshots in " * path_h5)
+            any(isfinite, energies) || error("D_pp verification failed: no finite snapshot energies in " * path_h5)
+        else
+            haskey(energy_group, "energy_histogram_counts") || error("D_pp verification failed: missing energy histogram counts in " * path_h5)
+            counts = read(energy_group["energy_histogram_counts"])
+            sum(counts) > 0 || error("D_pp verification failed: empty energy histograms in " * path_h5)
+        end
     end
 
     return true
@@ -1326,6 +1344,7 @@ function write_mu_cache_step!(writer, save_idx::Integer, mu_step)
 end
 
 function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_save, t_gyroperiods_save, alive_fraction_save, trajectory_time, save_time, time_reference)
+    (haskey(writer, :async) && writer.async) && finish_async_vector_writer!(writer)
     file = writer.file
     file["t_norm"] = Float64.(t_norm_save)
     file["t_s"] = Float64.(t_s_save)
@@ -1346,8 +1365,11 @@ function finalize_mu_cache_writer!(writer, cfg, energy_GeV, t_norm_save, t_s_sav
     file["cache_mode"] = "mu"
     file["cache_output_precision"] = string(writer.outtype)
     file["state_precision"] = string(cfg[:precision])
-    file["async_cache_writer_enabled"] = false
-    file["cache_writer_buffer_count"] = 1
+    file["async_cache_writer_enabled"] = Bool(haskey(writer, :async) && writer.async)
+    file["cache_writer_buffer_count"] = Int(haskey(writer, :buffer_count) ? writer.buffer_count : 1)
+    file["cache_transfer_count_per_state"] = 1
+    file["cache_transfer_layout"] = "mu_vector"
+    file["cache_writer_backend_version"] = (haskey(writer, :async) && writer.async) ? "gpu_async_cache_writer_v1" : "sync_mu_cache_writer_v1"
     file["mu_unit"] = "dimensionless"
     RunnerMod.write_injection_metadata!(file, cfg)
     close(file)
@@ -1464,7 +1486,9 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
     elapsed = NaN
     writer = nothing
     try
-        writer = create_mu_cache_writer(output_h5, cfg[:n_particles], nsave, cache_out_type)
+        writer = Bool(get(cfg, :async_cache_writer, true)) ?
+            create_async_vector_writer(output_h5, "mu", cfg[:n_particles], nsave, cache_out_type, Int(get(cfg, :cache_writer_buffer_count, 2))) :
+            create_mu_cache_writer(output_h5, cfg[:n_particles], nsave, cache_out_type)
 
         elapsed = @elapsed begin
             next_save_ptr = 1
@@ -1474,19 +1498,34 @@ function run_mu_cache_ensemble(cfg, fields, output_h5::AbstractString; energy_Ge
                 end
 
                 if next_save_ptr <= nsave && si == save_indices[next_save_ptr]
-                    @cuda threads=threads blocks=blocks reconstruct_mu_step_kernel!(
-                        dmu_step,
-                        dx1, dx2, dx3,
-                        dp1, dp2, dp3,
-                        dBx, dBy, dBz,
-                        xmin, ymin, zmin,
-                        xmax, ymax, zmax,
-                        dx, dy, dz,
-                        nx, ny, nz,
-                    )
-                    CUDA.synchronize()
                     alive_fraction[si] = Float64(Array(dalive_count)[1]) / Float64(cfg[:n_particles])
-                    write_mu_cache_step!(writer, next_save_ptr, Array(dmu_step))
+                    if haskey(writer, :async) && writer.async
+                        enqueue_vector_step!(writer, next_save_ptr) do slot_device
+                            @cuda threads=threads blocks=blocks reconstruct_mu_step_kernel!(
+                                slot_device,
+                                dx1, dx2, dx3,
+                                dp1, dp2, dp3,
+                                dBx, dBy, dBz,
+                                xmin, ymin, zmin,
+                                xmax, ymax, zmax,
+                                dx, dy, dz,
+                                nx, ny, nz,
+                            )
+                        end
+                    else
+                        @cuda threads=threads blocks=blocks reconstruct_mu_step_kernel!(
+                            dmu_step,
+                            dx1, dx2, dx3,
+                            dp1, dp2, dp3,
+                            dBx, dBy, dBz,
+                            xmin, ymin, zmin,
+                            xmax, ymax, zmax,
+                            dx, dy, dz,
+                            nx, ny, nz,
+                        )
+                        CUDA.synchronize()
+                        write_mu_cache_step!(writer, next_save_ptr, Array(dmu_step))
+                    end
                     next_save_ptr += 1
                 end
 
@@ -1684,9 +1723,20 @@ function run_combined_from_mu_cache(cfg)
         dmumu_sum_delta = zeros(Float64, n_bins, n_lags)
         dmumu_sum_delta2 = zeros(Float64, n_bins, n_lags)
 
-        chunk_size = min(Int(cfg[:particle_chunk_size]), selected_particle_count)
+        memory_plan = backend == :gpu ? CombinedFullMod.resolve_gpu_work_plan(
+            cfg;
+            particle_chunk_size=min(Int(cfg[:particle_chunk_size]), selected_particle_count),
+            lag_count=n_lags,
+            n_bins=n_bins,
+            bytes_per_particle_lag=sizeof(Int32) + 3 * sizeof(Float32),
+            base_bytes=sizeof(Float32) * nsteps * min(Int(cfg[:particle_chunk_size]), selected_particle_count),
+        ) : nothing
+        backend == :gpu && CombinedFullMod.print_gpu_work_plan("D_mumu mu-cache", memory_plan)
+        chunk_size = backend == :gpu ? min(memory_plan.particle_chunk_size, selected_particle_count) : min(Int(cfg[:particle_chunk_size]), selected_particle_count)
         chunk_size > 0 || error("particle_chunk_size must be positive.")
         nchunks = cld(selected_particle_count, chunk_size)
+        lag_ranges = backend == :gpu ? CombinedFullMod.gpu_lag_batches(lag_steps, memory_plan.lag_batch_size) : [1:n_lags]
+        gpu_accumulators = backend == :gpu ? CombinedFullMod.create_dmumu_gpu_accumulators(n_bins, n_lags) : nothing
 
         println("Mu cache HDF5: ", cfg[:cache_h5])
         println("Particle selection: ", cfg[:particle_selection])
@@ -1719,22 +1769,9 @@ function run_combined_from_mu_cache(cfg)
             mu_batch = read_mu_batch(mu_dataset, chunk_indices)
             if backend == :gpu
                 dmu_chunk = CuArray(permutedims(cfg[:compute_precision].(mu_batch), (2, 1)))
-                CombinedFullMod.process_mu_chunk_dmumu_gpu!(
-                    dmu_chunk,
-                    lag_steps,
-                    mu_edges,
-                    particle_counts,
-                    particle_means,
-                    particle_m2s,
-                    pair_sum_squares,
-                    pair_counts,
-                    dmumu_counts,
-                    dmumu_sum_delta,
-                    dmumu_sum_delta2,
-                    start_mode,
-                    bin_abs,
-                    cfg,
-                )
+                for lag_range in lag_ranges
+                    CombinedFullMod.process_mu_chunk_dmumu_gpu!(dmu_chunk, lag_steps, lag_range, mu_edges, gpu_accumulators, start_mode, bin_abs, cfg)
+                end
             else
                 mu_chunk = permutedims(mu_batch, (2, 1))
                 CombinedFullMod.process_mu_chunk_dmumu_cpu!(
@@ -1753,6 +1790,11 @@ function run_combined_from_mu_cache(cfg)
                     bin_abs,
                 )
             end
+        end
+
+        if backend == :gpu
+            CUDA.synchronize()
+            CombinedFullMod.copy_dmumu_gpu_accumulators!(gpu_accumulators, particle_counts, particle_means, particle_m2s, pair_sum_squares, pair_counts, dmumu_counts, dmumu_sum_delta, dmumu_sum_delta2)
         end
 
         delta_df = CombinedFullMod.build_output_dataframe(lag_steps, t_s, t_norm, particle_counts, particle_means, particle_m2s, pair_sum_squares, pair_counts)
@@ -2177,7 +2219,7 @@ function run_campaign(cfg)
     end
 
     write_summary(summary_path, summary_rows)
-    if cfg[:compute_dpp] && any(row -> row.dpp_status in ("ok", "skipped_existing"), summary_rows)
+    if cfg[:compute_dpp] && Bool(get(cfg[:dpp_overrides], :save_raw_energy_snapshots, false)) && any(row -> row.dpp_status in ("ok", "skipped_existing"), summary_rows)
         run_energy_distribution_plots(cfg[:campaign_root])
     end
     println()
@@ -2422,14 +2464,14 @@ function convert_override_value(key::Symbol, value, key_name::AbstractString)
     key in (:B_paths, :v_paths) && return config_tuple3_strings(value, key_name)
     key == :injection_position && return config_tuple3_floats(value, key_name)
     key == :field_subset && return config_field_subset(value, key_name)
-    key in (:precision, :trajectory_output_precision, :compute_precision) && return config_precision(value, key_name)
+    key in (:precision, :trajectory_output_precision, :compute_precision, :accumulator_precision) && return config_precision(value, key_name)
     key in (:boundary, :compute_backend, :particle_selection, :injection_mode, :injection_position_mode, :injection_position_unit) && return config_symbol(value, key_name)
     key == :lag_mode && return CombinedFullMod.parse_lag_mode(String(value))
     key == :lag_range_policy && return CombinedFullMod.normalize_lag_range_policy(value)
     key == :lag_common_scope && return CombinedFullMod.normalize_lag_common_scope(value)
     key == :lag_boundary_policy && return CombinedFullMod.normalize_lag_boundary_policy(value)
     key == :dmumu_start_mode && return CombinedFullMod.parse_dmumu_start_mode(value)
-    key == :mu_bin_abs && return config_bool(value, key_name)
+    key in (:mu_bin_abs, :async_cache_writer, :save_raw_energy_snapshots) && return config_bool(value, key_name)
     key == :n_particles_to_use && return config_maybe_particle_count(value, key_name)
     key == :max_lag_steps && return config_maybe_int(value, key_name)
     key in (:trajectory_duration_gyroperiods, :trajectory_save_interval_gyroperiods, :integration_steps_per_gyroperiod, :lag_min_gyroperiods, :lag_max_gyroperiods, :lag_stride_gyroperiods, :max_lag_boundary_relative_error) && return config_float(value, key_name)
@@ -2912,6 +2954,12 @@ function runtime_config()
             cfg[:dpp_overrides][:particle_block_size] = parse(Int, split(argument, "=", limit=2)[2])
         elseif startswith(argument, "--dpp-n-energy-snapshots=")
             cfg[:dpp_overrides][:n_energy_snapshots] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-n-energy-bins=")
+            cfg[:dpp_overrides][:n_energy_bins] = parse(Int, split(argument, "=", limit=2)[2])
+        elseif startswith(argument, "--dpp-save-raw-energy-snapshots=")
+            cfg[:dpp_overrides][:save_raw_energy_snapshots] = config_bool(split(argument, "=", limit=2)[2], "--dpp-save-raw-energy-snapshots")
+        elseif argument == "--dpp-save-raw-energy-snapshots"
+            cfg[:dpp_overrides][:save_raw_energy_snapshots] = true
         end
     end
     cli_requested_campaign_selection && (campaign_requests = nothing)
